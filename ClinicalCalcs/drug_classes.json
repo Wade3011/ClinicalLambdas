@@ -104,6 +104,7 @@
     },
     "Empagliflozin": {
       "class": "SGLT2",
+      "drug_in_class_bonus": 0.02,
       "allergy_labels": ["Empagliflozin (Jardiance)"],
       "clinical_base": 0.65,
       "deny_if": [
@@ -155,6 +156,7 @@
     },
     "Canagliflozin": {
       "class": "SGLT2",
+      "drug_in_class_bonus": 0,
       "allergy_labels": ["Canagliflozin (Invokana)"],
       "clinical_base": 0.65,
       "deny_if": [
@@ -206,6 +208,7 @@
     },
     "Ertugliflozin": {
       "class": "SGLT2",
+      "drug_in_class_bonus": -0.10,
       "allergy_labels": ["Ertugliflozin (Steglatro)"],
       "clinical_base": 0.65,
       "deny_if": [
@@ -258,6 +261,7 @@
     },
     "Dulaglutide": {
       "class": "GLP1",
+      "drug_in_class_bonus": 0.01,
       "allergy_labels": ["Dulaglutide (Trulicity)"],
       "clinical_base": 0.65,
       "deny_if": [
@@ -308,6 +312,7 @@
     },
     "Exenatide": {
       "class": "GLP1",
+      "drug_in_class_bonus": 0,
       "clinical_base": 0.65,
       "deny_if": [
         { "field": "comorbidity", "op": "in", "value": "MEN2" },
@@ -356,6 +361,7 @@
     },
     "Liraglutide": {
       "class": "GLP1",
+      "drug_in_class_bonus": 0,
       "clinical_base": 0.65,
       "deny_if": [
         { "field": "comorbidity", "op": "in", "value": "MEN2" },
@@ -406,6 +412,7 @@
     },
     "Pioglitazone": {
       "class": "TZD",
+      "drug_in_class_bonus": 0,
       "clinical_base": 0.50,
       "deny_if": [
         { "field": "comorbidity", "op": "in", "value": "Heart Failure (CHF)" },
@@ -430,6 +437,7 @@
     },
     "Saxagliptin": {
       "class": "DPP4",
+      "drug_in_class_bonus": -0.10,
       "clinical_base": 0.55,
       "deny_if": [
         { "field": "comorbidity", "op": "in", "value": "Acute Pancreatitis" },
@@ -452,6 +460,7 @@
     },
     "Alogliptin": {
       "class": "DPP4",
+      "drug_in_class_bonus": 0.01,
       "clinical_base": 0.55,
       "deny_if": [
         { "field": "comorbidity", "op": "in", "value": "Acute Pancreatitis" },
@@ -479,6 +488,7 @@
     },
     "Glimepiride": {
       "class": "Sulfonylurea",
+      "drug_in_class_bonus": 0.02,
       "clinical_base": 0.50,
       "deny_if": [
         { "field": "comorbidity", "op": "in", "value": "Frequent Hypoglycemia" },
@@ -510,6 +520,7 @@
     },
     "Basal Insulin": {
       "class": "Basal Insulin",
+      "drug_in_class_bonus": 0.02,
       "allergy_labels": ["Glargine (Lantus/Basaglar/Toujeo)", "Detemir (Levemir)", "Degludec (Tresiba)", "NPH (Basal principles)"],
       "display_name": "Glargine (Lantus)",
       "clinical_base": 0.60,
