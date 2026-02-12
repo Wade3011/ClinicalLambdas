@@ -144,7 +144,8 @@ def _rule_to_description(rule):
 
 
 def _patient_on_class_at_max_dose(patient, drug_class, drugs_config):
-    """True if patient has any current drug in drug_class that is at max dose (entire class should be excluded for add-on)."""
+    """True if patient has any current drug in drug_class that is at max dose (entire class should be excluded for add-on).
+    Uses explicit is_highest_tolerable_dose from frontend when set, else calculated is_at_max from dose/frequency."""
     if not drug_class or drug_class == "No Change" or not drugs_config:
         return False
     current_ids = patient.get("current_drug_ids", set())
@@ -154,7 +155,11 @@ def _patient_on_class_at_max_dose(patient, drug_class, drugs_config):
         if not cdata or cdata.get("class") != drug_class:
             continue
         med_info = med_info_dict.get(cid)
-        if not med_info or not med_info.get("dose"):
+        if not med_info:
+            continue
+        if med_info.get("is_highest_tolerable_dose") is True:
+            return True
+        if not med_info.get("dose"):
             continue
         _, is_at_max = calculate_next_dose(
             cdata.get("class", drug_class),
@@ -178,18 +183,22 @@ def calculate_clinical(drug_id, drug_data, patient, rules_json=None, goal1_data=
         return 0.0
     drug_class = drug_data.get("class", drug_id)
     # Exclude if patient is on this drug and already at max dose (no room to titrate)
+    # or frontend explicitly indicated "highest tolerable dose" (biguanides / GLP-1-GIP only)
     if drug_id in patient.get("current_drug_ids", set()):
         med_info = patient.get("current_medication_info", {}).get(drug_id)
-        if med_info and med_info.get("dose"):
-            _, is_at_max = calculate_next_dose(
-                drug_class,
-                med_info.get("dose", ""),
-                med_info.get("frequency", ""),
-                patient.get("eGFR"),
-                med_info.get("drugName"),
-            )
-            if is_at_max:
+        if med_info:
+            if med_info.get("is_highest_tolerable_dose") is True:
                 return 0.0
+            if med_info.get("dose"):
+                _, is_at_max = calculate_next_dose(
+                    drug_class,
+                    med_info.get("dose", ""),
+                    med_info.get("frequency", ""),
+                    patient.get("eGFR"),
+                    med_info.get("drugName"),
+                )
+                if is_at_max:
+                    return 0.0
     # Exclude entire class if patient is on any drug in this class at max dose (do not add another in same class)
     if _patient_on_class_at_max_dose(patient, drug_class, drugs_config):
         return 0.0
@@ -366,16 +375,19 @@ def get_all_drug_weight_details(config, patient, rules_json=None, normalized_glu
             denied_reasons.append(ALLERGY_DENIED_REASON)
         if drug_id in patient.get("current_drug_ids", set()):
             med_info = patient.get("current_medication_info", {}).get(drug_id)
-            if med_info and med_info.get("dose"):
-                _, is_at_max = calculate_next_dose(
-                    drug_class,
-                    med_info.get("dose", ""),
-                    med_info.get("frequency", ""),
-                    patient.get("eGFR"),
-                    med_info.get("drugName"),
-                )
-                if is_at_max:
-                    denied_reasons.append("Patient at max dose of this drug")
+            if med_info:
+                if med_info.get("is_highest_tolerable_dose") is True:
+                    denied_reasons.append("Patient at highest tolerable dose of this drug")
+                elif med_info.get("dose"):
+                    _, is_at_max = calculate_next_dose(
+                        drug_class,
+                        med_info.get("dose", ""),
+                        med_info.get("frequency", ""),
+                        patient.get("eGFR"),
+                        med_info.get("drugName"),
+                    )
+                    if is_at_max:
+                        denied_reasons.append("Patient at max dose of this drug")
         if drug_id not in patient.get("current_drug_ids", set()) and _patient_on_class_at_max_dose(patient, drug_class, drugs):
             denied_reasons.append("Patient already on this drug class at max dose; do not add another drug in same class")
         for rule in drug_data.get("deny_if", []):

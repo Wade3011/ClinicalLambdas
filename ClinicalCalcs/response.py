@@ -650,7 +650,7 @@ def _parse_claude_rationale(parsed):
     return None
 
 
-def call_claude_api(prompt, api_key, model="claude-sonnet-4-5-20250929", temperature=0.3, system_message=None, max_retries=3):
+def call_claude_api(prompt, api_key, model="claude-sonnet-4-5-20250929", temperature=0.2, system_message=None, max_retries=3):
     """Call Claude API; parse JSON. Returns dict with 'rationale' (list) and 'alternatives' (list).
     alternatives populates payload key 'alternatives' for frontend 'Why Other Options Weren't Preferred'."""
     api_url = "https://api.anthropic.com/v1/messages"

@@ -46,6 +46,25 @@ def _no_change_medication_label(patient, config):
     return "No change - " + ", ".join(names)
 
 
+def _get_current_med_info_for_dose(patient, drug_id, cls, config):
+    """Resolve is_currently_on and current_medication_info for get_recommended_dose.
+    Tries exact drug_id first; if not found, falls back to any drug in the same class the patient is on.
+    Returns (is_currently_on, current_medication_info). Used so dose-increase text shows for all drugs."""
+    current_med_info_dict = patient.get("current_medication_info", {})
+    current_drug_ids = patient.get("current_drug_ids", set())
+    current_med_info = current_med_info_dict.get(drug_id)
+    is_on_this_drug = drug_id in current_drug_ids
+    if not current_med_info and cls in patient.get("current_classes", []):
+        drugs_cfg = config.get("drugs", {})
+        for med_drug_id, med_info in current_med_info_dict.items():
+            if med_drug_id in current_drug_ids:
+                if (drugs_cfg.get(med_drug_id) or {}).get("class") == cls:
+                    current_med_info = med_info
+                    is_on_this_drug = True
+                    break
+    return is_on_this_drug, current_med_info
+
+
 def _single_no_change_label(patient, config, drug_id):
     """Return 'Maintain DrugName' for one drug (matches de-escalation format)."""
     drugs_config = config.get("drugs", {})
@@ -317,7 +336,7 @@ def lambda_handler(event, context):
                             assessment=assessment,
                         )
                         claude_model = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-5-20250929")
-                        claude_temperature = float(os.environ.get("CLAUDE_TEMPERATURE", "0.3"))
+                        claude_temperature = float(os.environ.get("CLAUDE_TEMPERATURE", "0.2"))
                         claude_result = call_claude_api(prompt, claude_api_key, claude_model, claude_temperature, system_message=system_message)
                         rationale = (claude_result.get("rationale") or rationale)[:15]
                         alternatives = claude_result.get("alternatives") or alternatives
@@ -374,8 +393,7 @@ def lambda_handler(event, context):
 
         current_drug_ids = patient.get("current_drug_ids", set())
         current_med_info_dict = patient.get("current_medication_info", {})
-        is_currently_on = top_drug_id in current_drug_ids
-        current_med_info = current_med_info_dict.get(top_drug_id)
+        is_currently_on, current_med_info = _get_current_med_info_for_dose(patient, top_drug_id, top_class, config)
         preferred_drug_by_class = request_data.get("preferredDrugByClass") or request_data.get("preferred_drug_by_class") or {}
         preferred_drug = preferred_drug_by_class.get(top_class) or top_drug_id
         best_medication = get_recommended_dose(
@@ -409,11 +427,12 @@ def lambda_handler(event, context):
                 expanded_choices.extend(_no_change_choices(patient, config, r))
             else:
                 preferred = preferred_drug_by_class.get(cls) or drug_id
+                is_on_this_drug, current_med_info = _get_current_med_info_for_dose(patient, drug_id, cls, config)
                 med = get_recommended_dose(
                     cls,
                     patient.get("eGFR"),
-                    is_currently_on=(drug_id in patient.get("current_drug_ids", set())),
-                    current_medication_info=patient.get("current_medication_info", {}).get(drug_id),
+                    is_currently_on=is_on_this_drug,
+                    current_medication_info=current_med_info,
                     goal2_data=goal2_data,
                     preferred_drug=preferred,
                 )
@@ -443,11 +462,13 @@ def lambda_handler(event, context):
         alternative_drug_names = [_drug_display_name(r, config) for r in alternative_results if r.get("coverage", 0) > 0]
         if lowest_cost_result and not top_two_choices_by_fit:
             lc_drug = lowest_cost_result.get("drug", lowest_cost_result.get("class"))
+            lc_cls = lowest_cost_result.get("class", "Metformin")
+            lc_is_on, lc_med_info = _get_current_med_info_for_dose(patient, lc_drug, lc_cls, config)
             lc_med = get_recommended_dose(
-                lowest_cost_result.get("class", "Metformin"),
+                lc_cls,
                 patient.get("eGFR"),
-                lc_drug in current_drug_ids,
-                current_med_info_dict.get(lc_drug),
+                lc_is_on,
+                lc_med_info,
                 goal2_data,
                 preferred_drug=lc_drug,
             )
@@ -467,7 +488,7 @@ def lambda_handler(event, context):
                     assessment=assessment,
                 )
                 claude_model = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-5-20250929")
-                claude_temperature = float(os.environ.get("CLAUDE_TEMPERATURE", "0.3"))
+                claude_temperature = float(os.environ.get("CLAUDE_TEMPERATURE", "0.2"))
                 claude_result = call_claude_api(prompt, claude_api_key, claude_model, claude_temperature, system_message=system_message)
                 rationale = (claude_result.get("rationale") or [])[:15]
                 claude_alternatives = claude_result.get("alternatives") or []
@@ -493,11 +514,13 @@ def lambda_handler(event, context):
             second_best_choice = {"medication": top_two_choices_by_fit[1]["medication"], "dose": top_two_choices_by_fit[1]["dose"]}
         if lowest_cost_result:
             lc_drug = lowest_cost_result.get("drug", lowest_cost_result.get("class"))
+            lc_cls = lowest_cost_result.get("class", "Metformin")
+            lc_is_on, lc_med_info = _get_current_med_info_for_dose(patient, lc_drug, lc_cls, config)
             lc_med = get_recommended_dose(
-                lowest_cost_result.get("class", "Metformin"),
+                lc_cls,
                 patient.get("eGFR"),
-                lc_drug in current_drug_ids,
-                current_med_info_dict.get(lc_drug),
+                lc_is_on,
+                lc_med_info,
                 goal2_data,
                 preferred_drug=lc_drug,
             )
