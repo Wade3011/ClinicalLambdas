@@ -6,7 +6,7 @@ import re
 
 DEFAULT_MEDICATIONS_FALLBACK = {
     "Metformin": {"medication": "Metformin IR", "dose": "1000mg BID"},
-    "SGLT2": {"medication": "Empagliflozin (Jardiance)", "dose": "25 mg daily"},
+    "SGLT2": {"medication": "Dapagliflozin (Farxiga)", "dose": "10 mg daily"},
     "GLP1": {"medication": "Semaglutide (Ozempic)", "dose": "0.5mg weekly, titrate to 1mg"},
     "TZD": {"medication": "Pioglitazone (Actos)", "dose": "30mg daily"},
     "DPP4": {"medication": "Sitagliptin (Januvia)", "dose": "100mg daily"},

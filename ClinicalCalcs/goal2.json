@@ -12,7 +12,7 @@
   },
   "default_medications": {
     "Metformin": { "medication": "Metformin IR", "dose": "1000mg BID" },
-    "SGLT2": { "medication": "Empagliflozin (Jardiance)", "dose": "25 mg daily" },
+    "SGLT2": { "medication": "Dapagliflozin (Farxiga)", "dose": "10 mg daily" },
     "GLP1": { "medication": "Semaglutide (Ozempic)", "dose": "0.5mg weekly, titrate to 1mg" },
     "TZD": { "medication": "Pioglitazone (Actos)", "dose": "30mg daily" },
     "DPP4": { "medication": "Sitagliptin (Januvia)", "dose": "100mg daily" },
@@ -31,11 +31,9 @@
     "SGLT2": {
       "eGFR_geq_20": "25 mg daily",
       "default": "Consult dosing guidelines",
-      "drug_order_by_min_eGFR": ["Empagliflozin", "Dapagliflozin", "Canagliflozin", "Bexagliflozin", "Ertugliflozin"],
+      "drug_order_by_min_eGFR": ["Dapagliflozin", "Canagliflozin", "Bexagliflozin"],
       "by_drug": {
-        "Empagliflozin": { "medication": "Empagliflozin (Jardiance)", "min_eGFR": 20, "eGFR_geq_20": "25 mg daily", "default": "Consult dosing guidelines (eGFR <20 not recommended)" },
         "Dapagliflozin": { "medication": "Dapagliflozin (Farxiga)", "min_eGFR": 25, "eGFR_geq_25": "10 mg daily", "default": "Consult dosing guidelines (eGFR <25 not recommended)" },
-        "Ertugliflozin": { "medication": "Ertugliflozin (Steglatro)", "min_eGFR": 45, "eGFR_geq_45": "15 mg daily", "default": "Consult dosing guidelines (eGFR <45 not recommended)" },
         "Canagliflozin": { "medication": "Canagliflozin (Invokana)", "min_eGFR": 30, "eGFR_geq_60": "300 mg daily", "eGFR_30_59": "100 mg daily (eGFR 30-59)", "default": "Consult dosing guidelines (eGFR <30 not recommended)" },
         "Bexagliflozin": { "medication": "Bexagliflozin (Brenzavvy)", "min_eGFR": 30, "eGFR_geq_30": "20 mg daily", "default": "Consult dosing guidelines (eGFR <30 not recommended)" }
       }
@@ -58,9 +56,6 @@
         "Semaglutide": { "medication": "Semaglutide (Ozempic)", "default": "0.25 mg weekly x4 weeks; then 0.5, 1, or 2 mg weekly (titrate every 4 weeks)" },
         "Dulaglutide": { "medication": "Dulaglutide (Trulicity)", "default": "0.75 mg weekly x4 weeks; then 1.5, 3, or 4.5 mg weekly (titrate every 4 weeks)" },
         "Tirzepatide": { "medication": "Tirzepatide (Mounjaro)", "default": "2.5 mg weekly x4 weeks; then 5–15 mg weekly (titrate every 4 weeks)" },
-        "Exenatide": { "medication": "Exenatide (Byetta)", "default": "5 mcg BID x4 weeks; then 10 mcg BID (titrate every 4 weeks)" },
-        "Exenatide ER": { "medication": "Exenatide ER (Bydureon)", "default": "2 mg weekly" },
-        "Liraglutide": { "medication": "Liraglutide (Victoza)", "default": "0.6 mg daily x1 week; then 1.2 or 1.8 mg daily (titrate weekly)" },
         "Semaglutide Oral": { "medication": "Semaglutide (Rybelsus)", "default": "3 mg daily without food, 8 oz water; after 30 days 7 mg daily; then 14 mg after 30 days on 7 mg" }
       }
     },

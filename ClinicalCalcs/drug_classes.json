@@ -102,32 +102,6 @@
         { "rule": { "field": "comorbidity", "op": "in", "value": "Obesity (BMI > 40)" }, "add": 0.05 }
       ]
     },
-    "Empagliflozin": {
-      "class": "SGLT2",
-      "drug_in_class_bonus": 0.02,
-      "allergy_labels": ["Empagliflozin (Jardiance)"],
-      "clinical_base": 0.65,
-      "deny_if": [
-        { "field": "comorbidity", "op": "in", "value": "Dialysis" },
-        { "field": "comorbidity", "op": "in", "value": "Pregnant" },
-        { "field": "comorbidity", "op": "in", "value": "Type 1 Diabetes" },
-        { "field": "comorbidity", "op": "in", "value": "Severe Genital Infections" },
-        { "field": "eGFR", "op": "lt", "value": 20 },
-        { "field": "comorbidity", "op": "in", "value": "DKA History" },
-        { "field": "a1c", "op": "ge", "value": 10.0 }
-      ],
-      "caution_if": [
-        { "rule": { "and": [{ "field": "eGFR", "op": "ge", "value": 25 }, { "field": "eGFR", "op": "lt", "value": 30 }] }, "penalty": 0.05 },
-        { "rule": { "field": "a1c", "op": "ge", "value": 9.0 }, "penalty": 0.20 },
-        { "rule": { "field": "allergy", "op": "in", "value": ["SGLT-2 Inhibitors", "SGLT2 Inhibitors"] }, "penalty": 0.20 }
-      ],
-      "clinical_boost": [
-        { "rule": { "field": "comorbidity", "op": "in", "value": "Heart Failure (CHF)" }, "add": 0.20 },
-        { "rule": { "field": "comorbidity", "op": "in", "value": "ASCVD" }, "add": 0.10 },
-        { "rule": { "field": "comorbidity", "op": "in", "value": "CKD" }, "add": 0.12 },
-        { "rule": { "field": "comorbidity", "op": "in", "value": "Obesity (BMI > 40)" }, "add": 0.05 }
-      ]
-    },
     "Dapagliflozin": {
       "class": "SGLT2",
       "allergy_labels": ["Dapagliflozin (Farxiga)"],
@@ -191,32 +165,6 @@
         { "field": "comorbidity", "op": "in", "value": "Type 1 Diabetes" },
         { "field": "comorbidity", "op": "in", "value": "Severe Genital Infections" },
         { "field": "eGFR", "op": "lt", "value": 30 },
-        { "field": "comorbidity", "op": "in", "value": "DKA History" },
-        { "field": "a1c", "op": "ge", "value": 10.0 }
-      ],
-      "caution_if": [
-        { "rule": { "and": [{ "field": "eGFR", "op": "ge", "value": 25 }, { "field": "eGFR", "op": "lt", "value": 30 }] }, "penalty": 0.05 },
-        { "rule": { "field": "a1c", "op": "ge", "value": 9.0 }, "penalty": 0.20 },
-        { "rule": { "field": "allergy", "op": "in", "value": ["SGLT-2 Inhibitors", "SGLT2 Inhibitors"] }, "penalty": 0.20 }
-      ],
-      "clinical_boost": [
-        { "rule": { "field": "comorbidity", "op": "in", "value": "Heart Failure (CHF)" }, "add": 0.20 },
-        { "rule": { "field": "comorbidity", "op": "in", "value": "ASCVD" }, "add": 0.10 },
-        { "rule": { "field": "comorbidity", "op": "in", "value": "CKD" }, "add": 0.12 },
-        { "rule": { "field": "comorbidity", "op": "in", "value": "Obesity (BMI > 40)" }, "add": 0.05 }
-      ]
-    },
-    "Ertugliflozin": {
-      "class": "SGLT2",
-      "drug_in_class_bonus": -0.10,
-      "allergy_labels": ["Ertugliflozin (Steglatro)"],
-      "clinical_base": 0.65,
-      "deny_if": [
-        { "field": "comorbidity", "op": "in", "value": "Dialysis" },
-        { "field": "comorbidity", "op": "in", "value": "Pregnant" },
-        { "field": "comorbidity", "op": "in", "value": "Type 1 Diabetes" },
-        { "field": "comorbidity", "op": "in", "value": "Severe Genital Infections" },
-        { "field": "eGFR", "op": "lt", "value": 45 },
         { "field": "comorbidity", "op": "in", "value": "DKA History" },
         { "field": "a1c", "op": "ge", "value": 10.0 }
       ],
@@ -308,79 +256,6 @@
         { "rule": { "field": "comorbidity", "op": "in", "value": "ASCVD" }, "add": 0.12 },
         { "rule": { "field": "comorbidity", "op": "in", "value": "Obesity (BMI > 40)" }, "add": 0.20 },
         { "rule": { "field": "a1c", "op": "ge", "value": 9 }, "add": 0.20 }
-      ]
-    },
-    "Exenatide": {
-      "class": "GLP1",
-      "drug_in_class_bonus": 0,
-      "clinical_base": 0.65,
-      "deny_if": [
-        { "field": "comorbidity", "op": "in", "value": "MEN2" },
-        { "field": "comorbidity", "op": "in", "value": "MTC" },
-        { "field": "comorbidity", "op": "in", "value": "MEN2/MTC or Family History" },
-        { "field": "comorbidity", "op": "in", "value": "Gastroparesis" },
-        { "field": "comorbidity", "op": "in", "value": "Acute Pancreatitis" },
-        { "field": "comorbidity", "op": "in", "value": "History of Pancreatitis" },
-        { "field": "comorbidity", "op": "in", "value": "Pregnant" },
-        { "field": "comorbidity", "op": "in", "value": "Moderate to severe GI issues" }
-      ],
-      "caution_if": [
-        { "rule": { "field": "comorbidity", "op": "in", "value": "Mild GI Issues" }, "penalty": 0.10 },
-        { "rule": { "field": "comorbidity", "op": "in", "value": "No active diabetes therapy" }, "penalty": 0.20 },
-        { "rule": { "field": "allergy", "op": "in", "value": ["GLP-1 Agonists", "GLP1 Agonists"] }, "penalty": 0.20 }
-      ],
-      "clinical_boost": [
-        { "rule": { "field": "comorbidity", "op": "in", "value": "ASCVD" }, "add": 0.12 },
-        { "rule": { "field": "comorbidity", "op": "in", "value": "Obesity (BMI > 40)" }, "add": 0.20 }
-      ]
-    },
-    "Exenatide ER": {
-      "class": "GLP1",
-      "drug_in_class_bonus": 0,
-      "clinical_base": 0.65,
-      "deny_if": [
-        { "field": "comorbidity", "op": "in", "value": "MEN2" },
-        { "field": "comorbidity", "op": "in", "value": "MTC" },
-        { "field": "comorbidity", "op": "in", "value": "MEN2/MTC or Family History" },
-        { "field": "comorbidity", "op": "in", "value": "Gastroparesis" },
-        { "field": "comorbidity", "op": "in", "value": "Acute Pancreatitis" },
-        { "field": "comorbidity", "op": "in", "value": "History of Pancreatitis" },
-        { "field": "comorbidity", "op": "in", "value": "Pregnant" },
-        { "field": "comorbidity", "op": "in", "value": "Moderate to severe GI issues" }
-      ],
-      "caution_if": [
-        { "rule": { "field": "comorbidity", "op": "in", "value": "Mild GI Issues" }, "penalty": 0.10 },
-        { "rule": { "field": "comorbidity", "op": "in", "value": "No active diabetes therapy" }, "penalty": 0.20 },
-        { "rule": { "field": "allergy", "op": "in", "value": ["GLP-1 Agonists", "GLP1 Agonists"] }, "penalty": 0.20 }
-      ],
-      "clinical_boost": [
-        { "rule": { "field": "comorbidity", "op": "in", "value": "ASCVD" }, "add": 0.12 },
-        { "rule": { "field": "comorbidity", "op": "in", "value": "Obesity (BMI > 40)" }, "add": 0.20 },
-        { "rule": { "field": "a1c", "op": "ge", "value": 9 }, "add": 0.15 }
-      ]
-    },
-    "Liraglutide": {
-      "class": "GLP1",
-      "drug_in_class_bonus": 0,
-      "clinical_base": 0.65,
-      "deny_if": [
-        { "field": "comorbidity", "op": "in", "value": "MEN2" },
-        { "field": "comorbidity", "op": "in", "value": "MTC" },
-        { "field": "comorbidity", "op": "in", "value": "MEN2/MTC or Family History" },
-        { "field": "comorbidity", "op": "in", "value": "Gastroparesis" },
-        { "field": "comorbidity", "op": "in", "value": "Acute Pancreatitis" },
-        { "field": "comorbidity", "op": "in", "value": "History of Pancreatitis" },
-        { "field": "comorbidity", "op": "in", "value": "Pregnant" },
-        { "field": "comorbidity", "op": "in", "value": "Moderate to severe GI issues" }
-      ],
-      "caution_if": [
-        { "rule": { "field": "comorbidity", "op": "in", "value": "Mild GI Issues" }, "penalty": 0.10 },
-        { "rule": { "field": "comorbidity", "op": "in", "value": "No active diabetes therapy" }, "penalty": 0.20 },
-        { "rule": { "field": "allergy", "op": "in", "value": ["GLP-1 Agonists", "GLP1 Agonists"] }, "penalty": 0.20 }
-      ],
-      "clinical_boost": [
-        { "rule": { "field": "comorbidity", "op": "in", "value": "ASCVD" }, "add": 0.12 },
-        { "rule": { "field": "comorbidity", "op": "in", "value": "Obesity (BMI > 40)" }, "add": 0.20 }
       ]
     },
     "Semaglutide Oral": {
