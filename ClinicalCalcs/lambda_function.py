@@ -273,6 +273,7 @@ def lambda_handler(event, context):
 
                 base_assessment = generate_assessment(patient, {}, normalized_glucose, goal3_data)
                 assessment = (base_assessment.rstrip(".") + assessment_suffix) if assessment_suffix else base_assessment
+                original_assessment = assessment
 
                 # Use same Claude call as normal flow - explain why top 2 (reduce/maintain) are recommended
                 exclude_deesc = set(r.get("drug", r.get("class")) for r in top3_deesc if r.get("drug") or r.get("class"))
@@ -313,6 +314,7 @@ def lambda_handler(event, context):
                             lowest_cost_result=lowest_cost_deesc,
                             is_deescalation=True,
                             a1c_above_goal=a1c_above_goal,
+                            assessment=assessment,
                         )
                         claude_model = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-5-20250929")
                         claude_temperature = float(os.environ.get("CLAUDE_TEMPERATURE", "0.3"))
@@ -322,11 +324,16 @@ def lambda_handler(event, context):
                         # Strip "No Change" bullets - not a drug; focus on add-on classes only
                         alternatives = [a for a in alternatives if "no change" not in a.lower()]
                         future_considerations = claude_result.get("future_considerations") or future_considerations
+                        # Use Claude's updated assessment if provided
+                        updated = claude_result.get("updated_assessment", "")
+                        if updated:
+                            assessment = updated
                     except Exception as claude_err:
                         _log(f"Claude API call failed for de-escalation: {claude_err}")
                 recommendation_timestamp = datetime.now(timezone.utc).isoformat()
                 body = {
                     "assessment": str(assessment),
+                    "original_assessment": str(original_assessment),
                     "rationale": rationale,
                     "alternatives": alternatives,
                     "futureConsiderations": future_considerations,
@@ -363,6 +370,7 @@ def lambda_handler(event, context):
         drugs = config.get("drugs", {})
         top_drug_data = drugs.get(top_drug_id, drugs.get(top_class, {}))
         assessment = generate_assessment(patient, top_result, normalized_glucose, goal3_data)
+        original_assessment = assessment
 
         current_drug_ids = patient.get("current_drug_ids", set())
         current_med_info_dict = patient.get("current_medication_info", {})
@@ -456,6 +464,7 @@ def lambda_handler(event, context):
                     alternative_drug_names=alternative_drug_names,
                     top_two_results=top_two_for_prompt,
                     lowest_cost_result=lowest_cost_result,
+                    assessment=assessment,
                 )
                 claude_model = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-5-20250929")
                 claude_temperature = float(os.environ.get("CLAUDE_TEMPERATURE", "0.3"))
@@ -463,6 +472,10 @@ def lambda_handler(event, context):
                 rationale = (claude_result.get("rationale") or [])[:15]
                 claude_alternatives = claude_result.get("alternatives") or []
                 future_considerations = claude_result.get("future_considerations") or []
+                # Use Claude's updated assessment if provided
+                updated = claude_result.get("updated_assessment", "")
+                if updated:
+                    assessment = updated
                 if not rationale:
                     rationale = generate_rationale(patient, top_result, top_drug_data)
             except Exception as claude_error:
@@ -583,6 +596,7 @@ def lambda_handler(event, context):
         recommendation_timestamp = datetime.now(timezone.utc).isoformat()
         body = {
             "assessment": str(assessment) if assessment is not None else "",
+            "original_assessment": str(original_assessment),
             "rationale": [str(x) for x in (rationale or [])],
             "alternatives": [str(x) for x in (alternatives or [])],
             "futureConsiderations": [str(x) for x in (future_considerations or [])],

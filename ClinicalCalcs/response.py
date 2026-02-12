@@ -319,9 +319,10 @@ def _granular_allergy_clarification(allergies_list):
     return " ALLERGY CLARIFICATION (for other_options_not_preferred): " + " ".join(parts)
 
 
-def build_claude_prompt(request_data, results, drug_classes, patient, alternative_drug_names=None, top_two_results=None, lowest_cost_result=None, is_deescalation=False, a1c_above_goal=False):
+def build_claude_prompt(request_data, results, drug_classes, patient, alternative_drug_names=None, top_two_results=None, lowest_cost_result=None, is_deescalation=False, a1c_above_goal=False, assessment=""):
     """Build system and user prompt for Claude API. Uses top_two_results when provided (the displayed #1 and #2).
     lowest_cost_result is the lowest cost option to determine if best_cost_explanation should be included.
+    assessment is the pre-computed clinical assessment text; Claude may return an updated version.
     is_deescalation=True: top options are reduce/maintain; explain why these are recommended per de-escalation rules.
     a1c_above_goal=True: when in de-escalation, A1C is above goal; future_considerations should include Metformin increase or add-on after reduction."""
     patient_info = request_data.get("patientInfo", {})
@@ -352,19 +353,21 @@ def build_claude_prompt(request_data, results, drug_classes, patient, alternativ
     allergy_parts = [_format_allergy_for_display(a) for a in allergies_list if _format_allergy_for_display(a)]
     allergies_str = "; ".join(allergy_parts) if allergy_parts else "None"
     granular_allergy_note = _granular_allergy_clarification(allergies_list)
-    system_message = """You are an expert clinical decision support system for diabetes medication recommendations.
-Your role is to provide clear, evidence-based explanations for medication choices that help clinicians understand
-why a specific medication is recommended for a patient. Write in professional medical language suitable for
-clinicians, focusing on clinical evidence, patient-specific factors, and practical considerations."""
+    system_message = """You are a board-certified endocrinologist and clinical pharmacologist specializing in Type 2 diabetes management. You explain pre-computed medication recommendations to fellow clinicians using evidence-based reasoning grounded in the provided reference documents.
+
+This output is displayed directly to prescribing clinicians in a clinical decision support tool. Accuracy is critical — unsupported claims could affect patient care. Cite ONLY evidence present in the provided reference documents. If the references do not support a claim, do not make it."""
     calc_ref = _load_reference_file("RECOMMENDATION_CALCULATION_REFERENCE.md")
-    if calc_ref:
-        system_message += "\n\n---\nCALCULATION REFERENCE (how the recommendation engine works; use this to align your explanations):\n---\n" + calc_ref
     pharm_ref = _load_reference_file("Type 2 Diabetes Pharmacotherapy Reference.docx.md")
-    if pharm_ref:
-        system_message += "\n\n---\nPHARMACOTHERAPY REFERENCE (ADA 2026 drug classes, mechanisms, benefits, cautions, trials; use for evidence-based explanations):\n---\n" + pharm_ref
     deesc_ref = _load_reference_file("Diabetes Med De-escalation handout.docx.md")
+    # Reference documents are included in the user prompt with XML tags for clear boundaries
+    ref_blocks = []
+    if calc_ref:
+        ref_blocks.append(f"<reference name=\"calculation\">\n{calc_ref}\n</reference>")
+    if pharm_ref:
+        ref_blocks.append(f"<reference name=\"pharmacotherapy\">\n{pharm_ref}\n</reference>")
     if deesc_ref:
-        system_message += "\n\n---\nDE-ESCALATION REFERENCE (use for Future Considerations when starting high-potency drugs or when lows are detected):\n---\n" + deesc_ref
+        ref_blocks.append(f"<reference name=\"de-escalation\">\n{deesc_ref}\n</reference>")
+    references_section = "\n\n".join(ref_blocks) if ref_blocks else ""
     cgm_lines = []
     if norm_glucose.get("time_in_range") is not None:
         cgm_lines.append(f"- CGM Time in Range: {norm_glucose['time_in_range']}%")
@@ -442,7 +445,10 @@ clinicians, focusing on clinical evidence, patient-specific factors, and practic
 - Cost Tier: {lowest_cost_drug_data.get('tier', 'N/A')} ({lowest_cost_drug_data.get('cost', 'N/A')} cost)
 ''' if lowest_cost_result and not lowest_cost_is_duplicate else '')}"""
 
-    user_prompt = f"""PATIENT PROFILE:
+    user_prompt = f"""{references_section}
+
+<patient_data>
+PATIENT PROFILE:
 - Age: {patient_info.get('age', 'N/A')} years
 - Current A1C: {patient_info.get('lastA1c', 'N/A')}%
 - A1C Goal: {patient_info.get('a1cGoal', 'N/A')}
@@ -457,12 +463,15 @@ clinicians, focusing on clinical evidence, patient-specific factors, and practic
 {cgm_block}
 {f'- Lows Detected: Yes' if lows_detected else ''}
 {f'- Additional Context: {request_data.get("additionalContext", "")}' if request_data.get("additionalContext") else ''}
+{f"""
+CLINICAL ASSESSMENT (pre-computed from patient data):
+{assessment}
+""" if assessment else ""}
 {rec_block}
 
 OTHER OPTIONS NOT IN TOP 3: {alt_drugs_str}
 {granular_allergy_note}
-
----"""
+</patient_data>"""
     if is_deescalation:
         top_rec = top_result.get("medication", top_result.get("class", "N/A"))
         top_dose = top_result.get("dose", "")
@@ -470,15 +479,15 @@ OTHER OPTIONS NOT IN TOP 3: {alt_drugs_str}
         second_dose = second_result.get("dose", "") if second_result else ""
         deesc_context = "A1C is above goal with documented hypoglycemia. Reduce sulfonylurea first; consider Metformin increase or add-on therapy after reduction." if a1c_above_goal else "A1C is at goal with hypoglycemia detected. The recommendations are REDUCE and MAINTAIN actions (not add-on therapy)."
         user_prompt += f"""
+<task_instructions>
 TASK: DE-ESCALATION MODE. {deesc_context}
-Generate a JSON response with the following structure. Use the DE-ESCALATION REFERENCE as the primary source.
+Generate a JSON response with the following structure. Use the <reference name="de-escalation"> as the primary source.
 
 REQUIRED FIELDS:
 
 1. "best_choice_explanation" (string): ONE concise sentence explaining why {top_rec} is the #1 recommendation.
-   - Reference the DE-ESCALATION REFERENCE (e.g., table 1.1 for sulfonylurea, table 1.2 for basal insulin).
+   - Cite the specific table from <reference name="de-escalation"> (e.g., table 1.1 for sulfonylurea, table 1.2 for basal insulin).
    - Explain the clinical rationale: hypoglycemia risk, handout guidance, dose reduction benefit.
-   - Example: "Glipizide carries highest hypoglycemia risk per handout table 1.1; cutting dose in half when at 10 mg or higher reduces hypoglycemia while preserving glycemic control."
 
 2. "second_choice_explanation" (string): ONE concise sentence explaining why {second_rec} is the #2 recommendation.
    - For MAINTAIN: explain why continuing at current dose is appropriate (e.g., metformin is foundational, low hypoglycemia risk).
@@ -488,92 +497,83 @@ REQUIRED FIELDS:
 ''' if lowest_cost_result and not lowest_cost_is_duplicate else '''
 3. "best_cost_explanation": OMIT (third option same as #1 or #2).
 '''}
-4. "other_options_not_preferred" (array of 2-3 strings): Brief explanations for why other drug CLASSES were not preferred. Use the SAME format as non-de-escalation mode.
-   - Group by drug class or common theme. Do NOT list individual drug names (e.g. "Empagliflozin, Dapagliflozin") - use class name only (e.g. "SGLT2 inhibitors").
-   - Focus ONLY on the add-on drug classes in the OTHER OPTIONS list. Do NOT include "No Change" or "do nothing" - that is not in the options list.
+4. "other_options_not_preferred" (array of 2-3 strings): One sentence each explaining why other drug CLASSES were not preferred.
+   - Group by drug class or common theme — use class name only (e.g. "SGLT2 inhibitors"), not individual drug names.
+   - Focus ONLY on the add-on drug classes in the OTHER OPTIONS list: {alt_drugs_str}. Do NOT include "No Change" or "do nothing."
    - If ALLERGY CLARIFICATION appears above: only the specific drug(s) named are excluded due to allergy; do NOT state the entire class is contraindicated.
-   - Example: "SGLT2 inhibitors and GLP-1 agonists are poor options when A1C at goal with hypoglycemia, as adding therapy would increase hypoglycemia risk."
-   - Do NOT mix best-choice rationale (e.g. "reduce sulfonylurea") into other_options_not_preferred. Keep each bullet focused on why THAT option was rejected.
+   - Do NOT mix best-choice rationale (e.g. "reduce sulfonylurea") into this field. Keep each bullet focused on why THAT option was rejected.
    - Maximum 3 bullets.
-   - Reference the OTHER OPTIONS list: {alt_drugs_str}
 
-5. "future_considerations" (array of strings): Monitoring and follow-up per DE-ESCALATION REFERENCE.
+5. "future_considerations" (array of strings): Monitoring and follow-up per <reference name="de-escalation">.
    - Recheck fasting glucose in 1-2 weeks.
    - If A1C rises after de-escalation, consider re-escalation.
    {f'- IMPORTANT: A1C is above goal. Include: reduce sulfonylurea per handout, then consider Metformin increase or add-on (SGLT2/GLP1/DPP4) to address A1C.' if a1c_above_goal else ''}
 
-RESPONSE FORMAT (return ONLY this JSON, no markdown or code blocks):
+6. "updated_assessment" (string): Return an updated version of the CLINICAL ASSESSMENT that incorporates relevant insights from the Additional Context and recommendation results. Preserve all core facts from the original. You may add 1-2 observations based on the patient profile or Additional Context — but do NOT introduce new diagnoses, risk assessments, or clinical claims not present in the patient data. Keep it concise (2-4 sentences total). If no changes are needed, return the original verbatim.
+
+RESPONSE FORMAT — return ONLY this JSON (no markdown, no code blocks, no extra text):
 {{
-  "best_choice_explanation": "One sentence for #1 reduce/maintain recommendation.",
-  "second_choice_explanation": "One sentence for #2 recommendation.",{f'''
-  "best_cost_explanation": "One sentence for third option if applicable.",''' if lowest_cost_result and not lowest_cost_is_duplicate else ''}
-  "other_options_not_preferred": [
-    "Drug class grouping reason 1.",
-    "Drug class grouping reason 2."
-  ],
-  "future_considerations": [
-    "Monitoring recommendation."
-  ]
+  "best_choice_explanation": "...",
+  "second_choice_explanation": "...",{f'''
+  "best_cost_explanation": "...",''' if lowest_cost_result and not lowest_cost_is_duplicate else ''}
+  "other_options_not_preferred": ["...", "..."],
+  "future_considerations": ["..."],
+  "updated_assessment": "..."
 }}
 
-IMPORTANT:
-- Use the DE-ESCALATION REFERENCE for clinical rationale.
-- Keep explanations concise (1 sentence each).
-- Return ONLY valid JSON. No markdown, code blocks, or extra text."""
+RULES:
+- Use Generic (Brand) format for all drug names: e.g., "Semaglutide (Ozempic)", "Empagliflozin (Jardiance)".
+- Keep explanations to 1 sentence each for fields 1-3.
+- Cite ONLY evidence from the provided <reference> documents. Do not cite trials or guidelines not present in the references.
+- Return ONLY valid JSON.
+</task_instructions>"""
     else:
         user_prompt += f"""
-TASK: Generate a JSON response with the following structure. Use the PHARMACOTHERAPY REFERENCE for trial citations and the DE-ESCALATION REFERENCE for future considerations.
+<task_instructions>
+TASK: Generate a JSON response with the following structure. Use <reference name="pharmacotherapy"> for trial citations and <reference name="de-escalation"> for future considerations.
 
 REQUIRED FIELDS:
 
 1. "best_choice_explanation" (string): ONE concise sentence explaining why {top_class} ({top_drug_id}) is the #1 choice.
-   - Must mention: comorbidity benefits relevant to this patient, glucose control ability, and cite a supporting clinical trial (e.g., UKPDS, SUSTAIN, CREDENCE).
-   - Use Generic (Brand) format for drug name.
-   - Example: "Metformin (Glucophage) offers optimal choice given established efficacy and renal safety at eGFR 32, providing robust glycemic control and CV benefits from landmark UKPDS trial."
+   - Mention: comorbidity benefits relevant to this patient, glucose control ability, and cite a supporting clinical trial from <reference name="pharmacotherapy"> (e.g., UKPDS, SUSTAIN, CREDENCE).
 
 2. "second_choice_explanation" (string): ONE concise sentence explaining why {second_class} ({second_drug_id}) is the #2 choice.
-   - Same format as above: comorbidity benefits, glucose control, trial citation.
-   - Use Generic (Brand) format.
+   - Same format: comorbidity benefits, glucose control, trial citation from <reference name="pharmacotherapy">.
 {f'''
 3. "best_cost_explanation" (string): ONE concise sentence explaining why {lowest_cost_class} ({lowest_cost_drug_id}) is the lowest cost option.
    - Focus on formulary tier, cost tier, and similar efficacy to alternatives.
 ''' if lowest_cost_result and not lowest_cost_is_duplicate else '''
 3. "best_cost_explanation": OMIT this field entirely (lowest cost option is same as #1 or #2).
 '''}
-4. "other_options_not_preferred" (array of 2-3 strings): Brief explanations for why other drug CLASSES were not preferred.
-   - Group by drug class or common theme (e.g., "Pioglitazone and Sulfonylurea are poor options due to weight gain potential in obese patients").
-   - Do NOT list individual drugs separately if they share the same reason.
-   - If ALLERGY CLARIFICATION appears above: the patient is open to trialing other drugs in that class; only the specific drug(s) named are excluded due to allergy. Do NOT state that the entire class (e.g. GLP-1 agonists) is contraindicated due to allergy. Only the specific drug(s) (e.g. Semaglutide (Ozempic)) are excluded; other drugs in that class may be in the top recommendations and must not be described as contraindicated.
+4. "other_options_not_preferred" (array of 2-3 strings): One sentence each explaining why other drug CLASSES were not preferred.
+   - Group by drug class or common theme — use class name only, not individual drug names.
+   - If ALLERGY CLARIFICATION appears above: only the specific drug(s) named are excluded due to allergy; do NOT state the entire class is contraindicated.
+   - Reference the OTHER OPTIONS list: {alt_drugs_str}
    - Maximum 3 bullets.
 
-5. "future_considerations" (array of strings): Recommendations based on DE-ESCALATION REFERENCE.
+5. "future_considerations" (array of strings): Recommendations based on <reference name="de-escalation">.
    - If starting a high-potency drug (GLP-1, Basal Insulin, Bolus Insulin), include relevant de-escalation guidance.
    - If patient has lows detected, include dose reduction recommendations.
    - If no de-escalation applies, return empty array [].
-   - Examples: "If semaglutide started, stop sitagliptin therapy.", "If basal insulin started, reduce sulfonylurea dose per table 1.1."
 
----
+6. "updated_assessment" (string): Return an updated version of the CLINICAL ASSESSMENT that incorporates relevant insights from the Additional Context and recommendation results. Preserve all core facts from the original. You may add 1-2 observations based on the patient profile or Additional Context — but do NOT introduce new diagnoses, risk assessments, or clinical claims not present in the patient data. Keep it concise (2-4 sentences total). If no changes are needed, return the original verbatim.
 
-RESPONSE FORMAT (return ONLY this JSON, no markdown or code blocks):
+RESPONSE FORMAT — return ONLY this JSON (no markdown, no code blocks, no extra text):
 {{
-  "best_choice_explanation": "One sentence for #1 choice with comorbidity benefits, glucose control, and trial citation.",
-  "second_choice_explanation": "One sentence for #2 choice with same format.",{f'''
-  "best_cost_explanation": "One sentence for lowest cost option.",''' if lowest_cost_result and not lowest_cost_is_duplicate else ''}
-  "other_options_not_preferred": [
-    "Drug class grouping reason 1.",
-    "Drug class grouping reason 2."
-  ],
-  "future_considerations": [
-    "De-escalation recommendation if applicable."
-  ]
+  "best_choice_explanation": "...",
+  "second_choice_explanation": "...",{f'''
+  "best_cost_explanation": "...",''' if lowest_cost_result and not lowest_cost_is_duplicate else ''}
+  "other_options_not_preferred": ["...", "..."],
+  "future_considerations": ["..."],
+  "updated_assessment": "..."
 }}
 
-IMPORTANT:
+RULES:
 - Use Generic (Brand) format for all drug names: e.g., "Semaglutide (Ozempic)", "Empagliflozin (Jardiance)".
-- Keep explanations concise (1 sentence each for best/second/cost).
-- Reference the PHARMACOTHERAPY REFERENCE for trial names and evidence.
-- Reference the DE-ESCALATION REFERENCE for future_considerations rules.
-- Return ONLY valid JSON. No markdown, code blocks, or extra text."""
+- Keep explanations to 1 sentence each for fields 1-3.
+- Cite ONLY trials and evidence from the provided <reference> documents. Do not cite trials or guidelines not present in the references.
+- Return ONLY valid JSON.
+</task_instructions>"""
     return system_message, user_prompt
 
 
@@ -615,11 +615,18 @@ def _parse_claude_rationale(parsed):
         elif val and isinstance(val, str) and val.strip():
             future_considerations.append(val.strip())
 
+        # Parse updated_assessment
+        updated_assessment = ""
+        val = parsed.get("updated_assessment")
+        if val and isinstance(val, str) and val.strip():
+            updated_assessment = val.strip()
+
         if rationale:
             return {
                 "rationale": rationale[:5],
                 "alternatives": alternatives[:3],
-                "future_considerations": future_considerations
+                "future_considerations": future_considerations,
+                "updated_assessment": updated_assessment,
             }
         return None
 
@@ -639,7 +646,7 @@ def _parse_claude_rationale(parsed):
                     alternatives.append(s.strip())
         elif val and isinstance(val, str) and val.strip():
             alternatives.append(val.strip())
-        return {"rationale": rationale, "alternatives": alternatives, "future_considerations": []}
+        return {"rationale": rationale, "alternatives": alternatives, "future_considerations": [], "updated_assessment": ""}
     return None
 
 
@@ -680,7 +687,7 @@ def call_claude_api(prompt, api_key, model="claude-sonnet-4-5-20250929", tempera
                             continue
                 sentences = re.split(r'[.!?]+\s+', text_content)
                 sentences = [s.strip() for s in sentences if s.strip() and len(s.strip()) > 20 and not s.startswith("```")]
-                return {"rationale": sentences[:9] if sentences else [], "alternatives": [], "future_considerations": []}
+                return {"rationale": sentences[:9] if sentences else [], "alternatives": [], "future_considerations": [], "updated_assessment": ""}
         except urllib.error.HTTPError as e:
             if 400 <= e.code < 500:
                 raise
