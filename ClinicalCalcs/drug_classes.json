@@ -130,7 +130,7 @@
     "Dapagliflozin": {
       "class": "SGLT2",
       "allergy_labels": ["Dapagliflozin (Farxiga)"],
-      "drug_in_class_bonus": 0.001,
+      "drug_in_class_bonus": 0.01,
       "clinical_base": 0.65,
       "deny_if": [
         { "field": "comorbidity", "op": "in", "value": "Dialysis" },
@@ -181,7 +181,7 @@
     "Bexagliflozin": {
       "class": "SGLT2",
       "allergy_labels": ["Bexagliflozin (Brenzavy)"],
-      "drug_in_class_bonus": -0.01,
+      "drug_in_class_bonus": -0.10,
       "clinical_base": 0.65,
       "deny_if": [
         { "field": "comorbidity", "op": "in", "value": "Dialysis" },
@@ -232,7 +232,7 @@
     "Semaglutide": {
       "class": "GLP1",
       "allergy_labels": ["Semaglutide (Ozempic)"],
-      "drug_in_class_bonus": 0.002,
+      "drug_in_class_bonus": 0.02,
       "display_name": "Ozempic",
       "clinical_base": 0.65,
       "deny_if": [
@@ -418,7 +418,7 @@
     },
     "Sitagliptin": {
       "class": "DPP4",
-      "drug_in_class_bonus": 0.002,
+      "drug_in_class_bonus": 0.02,
       "clinical_base": 0.55,
       "deny_if": [
         { "field": "comorbidity", "op": "in", "value": "Acute Pancreatitis" },
@@ -463,7 +463,7 @@
     },
     "Glipizide": {
       "class": "Sulfonylurea",
-      "drug_in_class_bonus": 0.001,
+      "drug_in_class_bonus": 0.01,
       "clinical_base": 0.50,
       "deny_if": [
         { "field": "comorbidity", "op": "in", "value": "Frequent Hypoglycemia" },
