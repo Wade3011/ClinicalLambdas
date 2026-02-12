@@ -211,11 +211,15 @@ def transform_request_to_patient(request_data, drug_classes=None, goal2_data=Non
                         break
             if drug_id:
                 current_drug_ids_set.add(drug_id)
-                patient["current_medication_info"][drug_id] = {
+                info = {
                     "drugName": drug_name or "",
                     "dose": dose,
                     "frequency": frequency,
                 }
+                # Frontend sends isHighestTolerableDose only for biguanides and GLP-1/GIP
+                if med.get("isHighestTolerableDose") is not None:
+                    info["is_highest_tolerable_dose"] = bool(med.get("isHighestTolerableDose"))
+                patient["current_medication_info"][drug_id] = info
     patient["current_drug_ids"] = current_drug_ids_set
 
     comorbidities = request_data.get("comorbidities", [])
