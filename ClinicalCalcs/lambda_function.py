@@ -7,6 +7,9 @@ import json
 import os
 import sys
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+EASTERN = ZoneInfo("America/New_York")
 try:
     import boto3
 except ImportError:
@@ -18,14 +21,87 @@ from dosing import get_recommended_dose
 from response import (
     generate_assessment,
     generate_rationale,
-    generate_alternatives,
     _drug_display_name,
     _build_drug_classes_from_config,
     find_cheapest_for_index2,
     build_claude_prompt,
     call_claude_api,
+    retrieve_from_bedrock_kb,
+    call_bedrock_claude,
 )
 from deescalation import should_recommend_deescalation, get_deescalation_recommendations
+from rule_interpreter import evaluate_structured_rule
+from scoring import _rule_context
+
+# Single source for API response display names. Used for top3BestOptions and allDrugWeights so #1, #2, and lowest cost all match.
+RESPONSE_DISPLAY_NAMES = {
+    "Bexagliflozin": "Bexagliflozin (Brenzavy)",
+    "Canagliflozin": "Canagliflozin (Invokana)",
+    "Dapagliflozin": "Dapagliflozin (Farxiga)",
+    "Empagliflozin": "Empagliflozin (Jardiance)",
+    "Ertugliflozin": "Ertugliflozin (Steglatro)",
+    "Metformin IR": "Metformin IR",
+    "Metformin SA": "Metformin SA",
+    "Glimepiride": "Glimepiride (Amaryl)",
+    "Glipizide": "Glipizide (Glucotrol)",
+    "Glyburide": "Glyburide (Diabeta)",
+    "Dulaglutide": "Dulaglutide (Trulicity)",
+    "Semaglutide": "Semaglutide (Ozempic)",
+    "Tirzepatide": "Tirzepatide (Mounjaro)",
+    "Semaglutide Oral": "Semaglutide (Rybelsus)",
+    "Alogliptin": "Alogliptin (Nesina)",
+    "Saxagliptin": "Saxagliptin (Onglyza)",
+    "Linagliptin": "Linagliptin (Tradjenta)",
+    "Sitagliptin": "Sitagliptin (Januvia)",
+    "Pioglitazone": "Pioglitazone (Actos)",
+    "Glargine": "Glargine (Lantus/Basaglar/Toujeo)",
+    "Detemir": "Detemir (Levemir)",
+    "Degludec": "Degludec (Tresiba)",
+    "NPH": "NPH (Basal principles)",
+    "Other": "Other",
+    "Lispro": "Lispro (Humalog)",
+    "Aspart": "Aspart (Novolog)",
+    "Glulisine": "Glulisine (Apidra)",
+}
+
+
+def _response_display_name(drug_id, cls, config):
+    """Display name for response payload. Only use RESPONSE_DISPLAY_NAMES; no fallback to config. All drugs must be mapped."""
+    return RESPONSE_DISPLAY_NAMES.get(drug_id, drug_id)
+
+
+def _rule_mentions_egfr(rule):
+    """True if rule or any nested and/or sub-rule has field 'eGFR'."""
+    if not isinstance(rule, dict):
+        return False
+    if rule.get("field") == "eGFR":
+        return True
+    for key in ("and", "or"):
+        for r in rule.get(key, []):
+            if _rule_mentions_egfr(r):
+                return True
+    return False
+
+
+def _eGFR_therapy_warning(patient, config):
+    """True when eGFR is below a threshold and a current therapy should be dose-reduced or stopped (deny_if or caution_if with eGFR)."""
+    current_ids = patient.get("current_drug_ids", set())
+    if not current_ids:
+        return False
+    drugs = config.get("drugs", {})
+    ctx = _rule_context(patient)
+    for drug_id in current_ids:
+        drug_data = drugs.get(drug_id)
+        if not drug_data:
+            continue
+        for rule in drug_data.get("deny_if", []):
+            if isinstance(rule, dict) and _rule_mentions_egfr(rule) and evaluate_structured_rule(rule, ctx):
+                return True
+        for caution in drug_data.get("caution_if", []):
+            r = caution.get("rule", caution) if isinstance(caution, dict) else caution
+            if isinstance(r, dict) and _rule_mentions_egfr(r) and evaluate_structured_rule(r, ctx):
+                return True
+    return False
 
 
 def _log(msg):
@@ -33,8 +109,146 @@ def _log(msg):
     sys.stdout.flush()
 
 
+# Comorbidities that warrant using the full model (no Haiku fallback). PDF: "simple cases" = clinical_fit > 0.9 and no complex comorbidities.
+_COMPLEX_COMORBIDITY_SIGNALS = frozenset({"CKD", "Chronic Kidney Disease", "Heart Failure (CHF)", "CHF", "ASCVD", "Cardiovascular disease", "Obesity (BMI > 40)"})
+
+
+def _use_haiku_fallback(patient, top_results):
+    """True when we can use Haiku for cost savings: top option has clinical_fit > 0.9 and no complex comorbidities."""
+    if not top_results or len(top_results) == 0:
+        return False
+    fit = float(top_results[0].get("clinical_fit") or 0)
+    if fit <= 0.9:
+        return False
+    comorbidities = patient.get("comorbidities") or set()
+    if len(comorbidities) >= 2:
+        return False
+    for c in comorbidities:
+        if any(s in str(c) for s in _COMPLEX_COMORBIDITY_SIGNALS):
+            return False
+    return True
+
+
+def _build_retrieval_query(request_data, top_results, is_deescalation=False):
+    """Build a focused retrieval query from patient context + top drug options (PDF-style).
+    Extracts key clinical signals for Knowledge Base retrieval; strips 'Other: ' prefixes."""
+    patient = request_data.get("patientInfo") or {}
+    comorbidities_raw = request_data.get("comorbidities") or []
+    medications_raw = request_data.get("currentMedications") or []
+    allergies_raw = request_data.get("allergies") or []
+    glucose = request_data.get("glucoseReadings") or {}
+
+    # Strip "Other: " prefix from comorbidities
+    comorbidities = []
+    for c in comorbidities_raw:
+        s = c if isinstance(c, str) else str(c)
+        cleaned = s.replace("Other: ", "").strip() if s.startswith("Other: ") else s.strip()
+        if cleaned:
+            comorbidities.append(cleaned)
+
+    # Extract current drug names and classes, strip "Other: "
+    current_drugs = []
+    for med in medications_raw:
+        if not isinstance(med, dict):
+            continue
+        drug_name = (med.get("drugName") or med.get("drug_name") or "").strip()
+        drug_class = (med.get("drugClass") or med.get("drug_class") or "").strip()
+        if drug_name.startswith("Other: "):
+            drug_name = drug_name.replace("Other: ", "").strip()
+        if drug_class.startswith("Other: "):
+            drug_class = drug_class.replace("Other: ", "").strip()
+        if drug_name:
+            current_drugs.append(drug_name)
+        elif drug_class:
+            current_drugs.append(drug_class)
+
+    # Top 3 recommended drug names and classes
+    recommended = []
+    for option in (top_results or [])[:3]:
+        if not isinstance(option, dict):
+            continue
+        name = option.get("drug_name") or option.get("drugName") or option.get("medication") or option.get("drug") or ""
+        drug_class = option.get("drug_class") or option.get("drugClass") or option.get("class") or ""
+        if isinstance(name, str) and name.startswith("Other: "):
+            name = name.replace("Other: ", "").strip()
+        if name and drug_class:
+            recommended.append("{} ({})".format(name, drug_class))
+        elif name:
+            recommended.append(name)
+        elif drug_class:
+            recommended.append(drug_class)
+
+    query_parts = []
+
+    # Core patient profile
+    age = patient.get("age") or patient.get("Age") or ""
+    a1c = patient.get("lastA1c") or patient.get("last_a1c") or patient.get("a1c") or ""
+    egfr = patient.get("eGFR") or patient.get("egfr") or ""
+    query_parts.append(
+        "Type 2 diabetes management for patient age {} with A1C {} and eGFR {}".format(age, a1c, egfr).strip()
+    )
+    if is_deescalation:
+        query_parts.append("De-escalation hypoglycemia dose reduction")
+
+    # Comorbidities
+    if comorbidities:
+        query_parts.append("Comorbidities: {}".format(", ".join(comorbidities)))
+
+    # Recommended drugs (what guidelines say about these options)
+    if recommended:
+        query_parts.append("Recommendations for: {}".format(", ".join(recommended)))
+
+    # Current medications
+    if current_drugs:
+        query_parts.append("Currently taking: {}".format(", ".join(current_drugs)))
+
+    # Glucose
+    fasting_avg = None
+    postprandial_avg = None
+    if isinstance(glucose, dict):
+        fasting_obj = glucose.get("fasting")
+        if isinstance(fasting_obj, dict):
+            fasting_avg = fasting_obj.get("average")
+        post_obj = glucose.get("postPrandial") or glucose.get("postprandial")
+        if isinstance(post_obj, dict):
+            postprandial_avg = post_obj.get("average")
+    if fasting_avg is not None or postprandial_avg is not None:
+        glucose_parts = []
+        if fasting_avg is not None:
+            glucose_parts.append("fasting average {}".format(fasting_avg))
+        if postprandial_avg is not None:
+            glucose_parts.append("postprandial average {}".format(postprandial_avg))
+        if glucose_parts:
+            query_parts.append("Glucose readings: {}".format(", ".join(glucose_parts)))
+
+    # Allergies
+    allergy_parts = []
+    for a in allergies_raw:
+        if not isinstance(a, dict):
+            continue
+        allergen = (a.get("allergen") or "").strip()
+        specific = a.get("specificDrugs") or a.get("specific_drugs") or []
+        if not allergen:
+            continue
+        if specific and (isinstance(specific, list) and "All" in specific or specific == "All"):
+            allergy_parts.append("full class exclusion: {}".format(allergen))
+        elif specific and isinstance(specific, list):
+            allergy_parts.append("{} ({})".format(allergen, ", ".join(str(s) for s in specific)))
+        else:
+            allergy_parts.append(allergen)
+    if allergy_parts:
+        query_parts.append("Allergies: {}".format(", ".join(allergy_parts)))
+
+    # Additional context (free text from clinician)
+    additional_context = (request_data.get("additionalContext") or request_data.get("additional_context") or "").strip()
+    if additional_context:
+        query_parts.append("Additional context: {}".format(additional_context))
+
+    return ". ".join(p for p in query_parts if p)
+
+
 def _no_change_medication_label(patient, config):
-    """Return 'No change - Drug1, Drug2' so it's clear which drugs the no-change option covers. (Legacy; prefer _no_change_choices.)"""
+    """Return drug names only (no literal 'No Change'). Used when single top result is no-change."""
     current_ids = patient.get("current_drug_ids", set())
     if not current_ids:
         return "No medication change"
@@ -43,42 +257,50 @@ def _no_change_medication_label(patient, config):
     for did in sorted(current_ids):
         d = drugs_config.get(did, {})
         names.append(_drug_display_name({"drug": did, "class": d.get("class", did)}, config))
-    return "No change - " + ", ".join(names)
+    return ", ".join(names)
 
 
 def _get_current_med_info_for_dose(patient, drug_id, cls, config):
     """Resolve is_currently_on and current_medication_info for get_recommended_dose.
-    Tries exact drug_id first; if not found, falls back to any drug in the same class the patient is on.
-    Returns (is_currently_on, current_medication_info). Used so dose-increase text shows for all drugs."""
+    Only uses info when the patient is on this specific drug (drug_id). No same-class fallback,
+    so when we recommend a different drug in the same class (e.g. Dapagliflozin vs Empagliflozin),
+    we show that drug's name and its own dose (start or titration), not the other drug's."""
     current_med_info_dict = patient.get("current_medication_info", {})
     current_drug_ids = patient.get("current_drug_ids", set())
     current_med_info = current_med_info_dict.get(drug_id)
     is_on_this_drug = drug_id in current_drug_ids
-    if not current_med_info and cls in patient.get("current_classes", []):
-        drugs_cfg = config.get("drugs", {})
-        for med_drug_id, med_info in current_med_info_dict.items():
-            if med_drug_id in current_drug_ids:
-                if (drugs_cfg.get(med_drug_id) or {}).get("class") == cls:
-                    current_med_info = med_info
-                    is_on_this_drug = True
-                    break
     return is_on_this_drug, current_med_info
 
 
 def _single_no_change_label(patient, config, drug_id):
-    """Return 'Maintain DrugName' for one drug (matches de-escalation format)."""
+    """Return 'Continue DrugName' for one drug (matches de-escalation and normal flow)."""
     drugs_config = config.get("drugs", {})
     d = drugs_config.get(drug_id, {})
     name = _drug_display_name({"drug": drug_id, "class": d.get("class", drug_id)}, config)
-    return f"Maintain {name}"
+    return f"Continue {name}"
+
+
+# When uninsured + cannot afford copay, limit to these classes only (affordability gate)
+AFFORDABILITY_GATE_CLASSES = frozenset({"Metformin", "TZD", "Sulfonylurea", "Basal Insulin", "Bolus Insulin", "No Change"})
+
+
+def _filter_config_for_affordability_gate(config):
+    """Return a copy of config with only drugs in AFFORDABILITY_GATE_CLASSES (and those classes)."""
+    classes = config.get("classes", {})
+    drugs = config.get("drugs", {})
+    new_drugs = {did: dict(d) for did, d in drugs.items() if isinstance(d, dict) and d.get("class") in AFFORDABILITY_GATE_CLASSES}
+    new_classes = {k: dict(v) for k, v in classes.items() if k in AFFORDABILITY_GATE_CLASSES}
+    return {"classes": new_classes, "drugs": new_drugs}
 
 
 def _no_change_choices(patient, config, no_change_result):
-    """Expand 'No Change' into one choice per current drug. Returns list of {medication, dose, class, drug, clinical_fit, coverage}."""
+    """Expand 'No Change' into one choice per current drug. Returns list of {medication, dose, class, drug, clinical_fit, coverage}.
+    medication and class = drug name only (never the literal 'No Change'); dose = current dose."""
     current_ids = sorted(patient.get("current_drug_ids", set()))
     if not current_ids:
-        return [{"medication": "No medication change", "dose": "Continue current therapy", "class": "No Change", "drug": "No Change",
+        return [{"medication": "No medication change", "dose": "Continue current therapy", "class": "No medication change", "drug": "No Change",
                  "clinical_fit": no_change_result.get("clinical_fit", 0), "coverage": no_change_result.get("coverage", 0)}]
+    drugs_config = config.get("drugs", {})
     current_med_info = patient.get("current_medication_info", {})
     choices = []
     for did in current_ids:
@@ -87,10 +309,13 @@ def _no_change_choices(patient, config, no_change_result):
         if med_info and med_info.get("dose"):
             freq = med_info.get("frequency", "")
             dose = f"{med_info['dose']} {freq}".strip() if freq else med_info["dose"]
+        cls = drugs_config.get(did, {}).get("class", did)
+        drug_name = _response_display_name(did, cls, config)
+        medication = f"Continue {drug_name}"
         choices.append({
-            "medication": _single_no_change_label(patient, config, did),
+            "medication": medication,
             "dose": dose,
-            "class": "No Change",
+            "class": medication,
             "drug": did,
             "clinical_fit": no_change_result.get("clinical_fit", 0),
             "coverage": no_change_result.get("coverage", 0),
@@ -121,21 +346,8 @@ def _get_user_id_from_event(event):
             pass
         # When authorizer exists, only use JWT - never body (security)
         return None
-    # No authorizer: fallback for direct Lambda invocation / testing
-    body = event.get("body", event)
-    if isinstance(body, str):
-        try:
-            body = json.loads(body) if body else {}
-        except Exception:
-            body = {}
-    if isinstance(body, dict):
-        uid = body.get("userID") or body.get("userId")
-        if uid:
-            return str(uid)
-        pid = (body.get("patientInfo") or {}).get("userID") or (body.get("patientInfo") or {}).get("userId")
-        if pid:
-            return str(pid)
-    return event.get("userID") or event.get("userId")
+    # No authorizer: no fallback (require auth)
+    return None
 
 
 def _invoke_save_history(event, request_data, response_body, context, recommendation_timestamp):
@@ -228,6 +440,11 @@ def lambda_handler(event, context):
         patient = transform_request_to_patient(request_data, config, goal2_data)
         normalized_glucose = normalize_glucose_readings(request_data)
 
+        # Affordability gate: uninsured + cannot afford copay -> limit to Metformin, TZD, Sulfonylurea, Insulin (and No Change)
+        if patient.get("insurance") == "No Insurance" and patient.get("can_afford_copay") is False:
+            config = _filter_config_for_affordability_gate(config)
+            _log("Handler: affordability gate applied (uninsured, cannot afford copay); limited drug set")
+
         # 1.3 De-escalation: When lows detected, recommend reduce/maintain (regardless of A1C).
         # Hypoglycemia requires dose reduction first; when A1C > goal, add-on can follow after reduction.
         if should_recommend_deescalation(patient, normalized_glucose):
@@ -248,7 +465,7 @@ def lambda_handler(event, context):
                 lc_copy = dict(top3_deesc[2])
                 med = lc_copy.get("medication", "")
                 drug_id = lc_copy.get("drug", "")
-                if drug_id and (med.startswith("Reduce ") or med.startswith("Maintain ") or med.startswith("Stop ")):
+                if drug_id and (med.startswith("Reduce ") or med.startswith("Continue ") or med.startswith("Stop ")):
                     lc_copy["medication"] = _drug_display_name(
                         {"drug": drug_id, "class": lc_copy.get("class", drug_id)}, config
                     )
@@ -264,31 +481,14 @@ def lambda_handler(event, context):
                 )
                 drugs_config = config.get("drugs", {})
                 all_drug_weights_payload = []
-                current_ids = patient.get("current_drug_ids", set())
                 for e in all_drug_weights:
                     payload_entry = dict(e)
                     drug_id = e.get("drug")
                     cls = e.get("class")
                     if drug_id == "No Change" or cls == "No Change":
-                        if current_ids:
-                            for did in sorted(current_ids):
-                                row = dict(payload_entry)
-                                row["class"] = _drug_display_name(
-                                    {"drug": did, "class": drugs_config.get(did, {}).get("class", did)},
-                                    config,
-                                ) + " (No change)"
-                                all_drug_weights_payload.append(row)
-                        else:
-                            continue  # Skip when no current meds
-                    else:
-                        # Skip: current drugs already appear as "X (No change)" above
-                        if drug_id in current_ids:
-                            continue
-                        payload_entry["class"] = _drug_display_name(
-                            {"drug": drug_id, "class": cls},
-                            config,
-                        )
-                        all_drug_weights_payload.append(payload_entry)
+                        continue
+                    payload_entry["class"] = _response_display_name(drug_id, cls, config)
+                    all_drug_weights_payload.append(payload_entry)
 
                 base_assessment = generate_assessment(patient, {}, normalized_glucose, goal3_data)
                 assessment = (base_assessment.rstrip(".") + assessment_suffix) if assessment_suffix else base_assessment
@@ -322,7 +522,56 @@ def lambda_handler(event, context):
                 ]
 
                 claude_api_key = os.environ.get("CLAUDE_API_KEY")
-                if claude_api_key and claude_api_key.strip():
+                bedrock_model = (os.environ.get("BEDROCK_MODEL_ID") or "").strip()
+                bedrock_kb_id = (os.environ.get("BEDROCK_KNOWLEDGE_BASE_ID") or "").strip()
+                bedrock_region = (os.environ.get("BEDROCK_REGION") or "").strip() or None
+                use_bedrock = bool(bedrock_model and bedrock_kb_id)
+                if use_bedrock:
+                    try:
+                        drug_classes = _build_drug_classes_from_config(config)
+                        top_two_for_prompt = top3_deesc[:2] if len(top3_deesc) >= 2 else (top3_deesc[:1] if top3_deesc else [])
+                        kb_query = _build_retrieval_query(request_data, top3_deesc, is_deescalation=True)
+                        kb_refs, kb_chunk_count = retrieve_from_bedrock_kb(bedrock_kb_id, kb_query, region=bedrock_region, number_of_results=5)
+                        system_message, prompt = build_claude_prompt(
+                            request_data, results_deesc or [], drug_classes, patient,
+                            alternative_drug_names=alternative_drug_names,
+                            top_two_results=top_two_for_prompt,
+                            lowest_cost_result=lowest_cost_deesc,
+                            is_deescalation=True,
+                            a1c_above_goal=a1c_above_goal,
+                            assessment=assessment,
+                            kb_references_section=kb_refs if kb_refs else None,
+                        )
+                        claude_temperature = float(os.environ.get("CLAUDE_TEMPERATURE", "0.3"))
+                        _cache_val = (os.environ.get("BEDROCK_PROMPT_CACHE", "") or "").strip().lower()
+                        use_cache = _cache_val not in ("0", "false", "no")
+                        bedrock_model_to_use = (os.environ.get("BEDROCK_HAIKU_MODEL_ID") or "").strip() if _use_haiku_fallback(patient, top3_deesc) else bedrock_model
+                        if bedrock_model_to_use != bedrock_model:
+                            _log(f"Claude model (Bedrock): {bedrock_model_to_use} (Haiku fallback)")
+                        else:
+                            _log(f"Claude model (Bedrock): {bedrock_model}")
+                        _log(f"Bedrock: full prompt length={len(prompt)} chars (no truncation)")
+                        claude_result = call_bedrock_claude(
+                            prompt,
+                            bedrock_model_to_use or bedrock_model,
+                            temperature=claude_temperature,
+                            system_message=system_message,
+                            region=bedrock_region,
+                            use_cache=use_cache,
+                        )
+                        _log("Bedrock: succeeded")
+                        top3_drugs_deesc = [o.get("medication") or o.get("drug_name") or o.get("drug") or "" for o in top3_deesc[:3]]
+                        _log(json.dumps({"event": "bedrock_invocation", "input_tokens": claude_result.get("input_tokens"), "output_tokens": claude_result.get("output_tokens"), "ada_passages_retrieved": kb_chunk_count, "top3_drugs": top3_drugs_deesc}))
+                        rationale = (claude_result.get("rationale") or rationale)[:15]
+                        alternatives = claude_result.get("alternatives") or alternatives
+                        alternatives = [a for a in alternatives if "no change" not in a.lower()]
+                        future_considerations = claude_result.get("future_considerations") or future_considerations
+                        updated = claude_result.get("updated_assessment", "")
+                        if updated:
+                            assessment = updated
+                    except Exception as claude_err:
+                        _log(f"Bedrock API call failed for de-escalation: {claude_err}")
+                elif claude_api_key and claude_api_key.strip():
                     try:
                         drug_classes = _build_drug_classes_from_config(config)
                         top_two_for_prompt = top3_deesc[:2] if len(top3_deesc) >= 2 else (top3_deesc[:1] if top3_deesc else [])
@@ -337,19 +586,38 @@ def lambda_handler(event, context):
                         )
                         claude_model = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-5-20250929")
                         claude_temperature = float(os.environ.get("CLAUDE_TEMPERATURE", "0.2"))
+                        _log(f"Claude model: {claude_model}")
                         claude_result = call_claude_api(prompt, claude_api_key, claude_model, claude_temperature, system_message=system_message)
                         rationale = (claude_result.get("rationale") or rationale)[:15]
                         alternatives = claude_result.get("alternatives") or alternatives
-                        # Strip "No Change" bullets - not a drug; focus on add-on classes only
                         alternatives = [a for a in alternatives if "no change" not in a.lower()]
                         future_considerations = claude_result.get("future_considerations") or future_considerations
-                        # Use Claude's updated assessment if provided
                         updated = claude_result.get("updated_assessment", "")
                         if updated:
                             assessment = updated
                     except Exception as claude_err:
                         _log(f"Claude API call failed for de-escalation: {claude_err}")
-                recommendation_timestamp = datetime.now(timezone.utc).isoformat()
+                # Build top3 for response with full display names (e.g. "Reduce Empagliflozin (Jardiance)").
+                top3_deesc_for_body = []
+                for opt in top3_deesc:
+                    out = dict(opt)
+                    if opt.get("drug") and opt.get("drug") != "No Change" and opt.get("class"):
+                        full_name = _response_display_name(opt["drug"], opt["class"], config)
+                        med = (opt.get("medication") or "").strip()
+                        if med.startswith("Reduce"):
+                            out["medication"] = f"Reduce {full_name}"
+                        elif med.startswith("Continue"):
+                            out["medication"] = f"Continue {full_name}"
+                        elif med.startswith("Stop"):
+                            out["medication"] = f"Stop {full_name}"
+                        else:
+                            out["medication"] = full_name
+                    top3_deesc_for_body.append(out)
+                # "***see future considerations***": append when Additional Context is not empty (not when AI returns items)
+                additional_context = (request_data.get("additionalContext") or request_data.get("additional_context") or "").strip()
+                if additional_context and "***see future considerations***" not in (assessment or ""):
+                    assessment = (assessment or "").rstrip(".") + " ***see future considerations***."
+                recommendation_timestamp = datetime.now(EASTERN).isoformat()
                 body = {
                     "assessment": str(assessment),
                     "original_assessment": str(original_assessment),
@@ -357,8 +625,9 @@ def lambda_handler(event, context):
                     "alternatives": alternatives,
                     "futureConsiderations": future_considerations,
                     "allDrugWeights": all_drug_weights_payload,
-                    "top3BestOptions": top3_deesc,
+                    "top3BestOptions": top3_deesc_for_body,
                     "recommendationTimestamp": recommendation_timestamp,
+                    "warning-eGFR": _eGFR_therapy_warning(patient, config),
                 }
                 if context and getattr(context, "aws_request_id", None):
                     body["requestId"] = context.aws_request_id
@@ -436,12 +705,14 @@ def lambda_handler(event, context):
                     goal2_data=goal2_data,
                     preferred_drug=preferred,
                 )
+                med_display = _response_display_name(drug_id, cls, config)
+                medication_label = f"Increase {med_display}" if is_on_this_drug else f"Start {med_display}"
                 expanded_choices.append({
                     "class": cls,
                     "drug": drug_id,
                     "clinical_fit": round(float(r["clinical_fit"]), 2),
                     "coverage": round(float(r["coverage"]), 2),
-                    "medication": str(med["medication"]),
+                    "medication": medication_label,
                     "dose": str(med["dose"]),
                 })
         top_two_choices_by_fit = expanded_choices[:2]
@@ -462,7 +733,7 @@ def lambda_handler(event, context):
         alternative_drug_names = [_drug_display_name(r, config) for r in alternative_results if r.get("coverage", 0) > 0]
         if lowest_cost_result and not top_two_choices_by_fit:
             lc_drug = lowest_cost_result.get("drug", lowest_cost_result.get("class"))
-            lc_cls = lowest_cost_result.get("class", "Metformin")
+            lc_cls = lowest_cost_result.get("class") or lowest_cost_result.get("drug") or ""
             lc_is_on, lc_med_info = _get_current_med_info_for_dose(patient, lc_drug, lc_cls, config)
             lc_med = get_recommended_dose(
                 lc_cls,
@@ -475,8 +746,62 @@ def lambda_handler(event, context):
             lowest_cost_med_name = str(lc_med.get("medication", ""))
 
         claude_api_key = os.environ.get("CLAUDE_API_KEY")
+        bedrock_model = (os.environ.get("BEDROCK_MODEL_ID") or "").strip()
+        bedrock_kb_id = (os.environ.get("BEDROCK_KNOWLEDGE_BASE_ID") or "").strip()
+        bedrock_region = (os.environ.get("BEDROCK_REGION") or "").strip() or None
+        use_bedrock = bool(bedrock_model and bedrock_kb_id)
         use_claude = claude_api_key and claude_api_key.strip()
-        if use_claude:
+        if use_bedrock:
+            try:
+                drug_classes = _build_drug_classes_from_config(config)
+                top_two_for_prompt = top_two_choices_by_fit[:2] if top_two_choices_by_fit and len(top_two_choices_by_fit) >= 2 else None
+                kb_query = _build_retrieval_query(request_data, top_two_choices_by_fit or [], is_deescalation=False)
+                kb_refs, kb_chunk_count = retrieve_from_bedrock_kb(bedrock_kb_id, kb_query, region=bedrock_region, number_of_results=5)
+                system_message, prompt = build_claude_prompt(
+                    request_data, results, drug_classes, patient,
+                    alternative_drug_names=alternative_drug_names,
+                    top_two_results=top_two_for_prompt,
+                    lowest_cost_result=lowest_cost_result,
+                    assessment=assessment,
+                    kb_references_section=kb_refs if kb_refs else None,
+                )
+                claude_temperature = float(os.environ.get("CLAUDE_TEMPERATURE", "0.3"))
+                _cache_val = (os.environ.get("BEDROCK_PROMPT_CACHE", "") or "").strip().lower()
+                use_cache = _cache_val not in ("0", "false", "no")
+                top3_for_log = list((top_two_choices_by_fit or [])[:2])
+                if lowest_cost_result:
+                    top3_for_log.append(lowest_cost_result)
+                bedrock_model_to_use = (os.environ.get("BEDROCK_HAIKU_MODEL_ID") or "").strip() if _use_haiku_fallback(patient, top_two_choices_by_fit or []) else bedrock_model
+                if bedrock_model_to_use != bedrock_model:
+                    _log(f"Claude model (Bedrock): {bedrock_model_to_use} (Haiku fallback)")
+                else:
+                    _log(f"Claude model (Bedrock): {bedrock_model}")
+                _log(f"Bedrock: full prompt length={len(prompt)} chars (no truncation)")
+                claude_result = call_bedrock_claude(
+                    prompt,
+                    bedrock_model_to_use or bedrock_model,
+                    temperature=claude_temperature,
+                    system_message=system_message,
+                    region=bedrock_region,
+                    use_cache=use_cache,
+                )
+                _log("Bedrock: succeeded")
+                top3_drugs_names = [o.get("medication") or o.get("drug_name") or o.get("drug") or "" for o in top3_for_log[:3]]
+                _log(json.dumps({"event": "bedrock_invocation", "input_tokens": claude_result.get("input_tokens"), "output_tokens": claude_result.get("output_tokens"), "ada_passages_retrieved": kb_chunk_count, "top3_drugs": top3_drugs_names}))
+                rationale = (claude_result.get("rationale") or [])[:15]
+                claude_alternatives = claude_result.get("alternatives") or []
+                future_considerations = claude_result.get("future_considerations") or []
+                updated = claude_result.get("updated_assessment", "")
+                if updated:
+                    assessment = updated
+                if not rationale:
+                    rationale = generate_rationale(patient, top_result, top_drug_data)
+            except Exception as claude_error:
+                print(f"Bedrock API call failed: {claude_error}")
+                rationale = generate_rationale(patient, top_result, top_drug_data)
+                claude_alternatives = []
+                future_considerations = []
+        elif use_claude:
             try:
                 drug_classes = _build_drug_classes_from_config(config)
                 top_two_for_prompt = top_two_choices_by_fit[:2] if top_two_choices_by_fit and len(top_two_choices_by_fit) >= 2 else None
@@ -489,11 +814,11 @@ def lambda_handler(event, context):
                 )
                 claude_model = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-5-20250929")
                 claude_temperature = float(os.environ.get("CLAUDE_TEMPERATURE", "0.2"))
+                _log(f"Claude model: {claude_model}")
                 claude_result = call_claude_api(prompt, claude_api_key, claude_model, claude_temperature, system_message=system_message)
                 rationale = (claude_result.get("rationale") or [])[:15]
                 claude_alternatives = claude_result.get("alternatives") or []
                 future_considerations = claude_result.get("future_considerations") or []
-                # Use Claude's updated assessment if provided
                 updated = claude_result.get("updated_assessment", "")
                 if updated:
                     assessment = updated
@@ -514,7 +839,7 @@ def lambda_handler(event, context):
             second_best_choice = {"medication": top_two_choices_by_fit[1]["medication"], "dose": top_two_choices_by_fit[1]["dose"]}
         if lowest_cost_result:
             lc_drug = lowest_cost_result.get("drug", lowest_cost_result.get("class"))
-            lc_cls = lowest_cost_result.get("class", "Metformin")
+            lc_cls = lowest_cost_result.get("class") or lowest_cost_result.get("drug") or ""
             lc_is_on, lc_med_info = _get_current_med_info_for_dose(patient, lc_drug, lc_cls, config)
             lc_med = get_recommended_dose(
                 lc_cls,
@@ -541,14 +866,9 @@ def lambda_handler(event, context):
             }
             for e in all_drug_weights
         }
-        # Use Claude-generated alternatives (2 sentences per drug) when available; else fallback to generate_alternatives
-        alternatives = claude_alternatives if claude_alternatives else generate_alternatives(
-            results, top_class, top_drug_id, config,
-            exclude_ids=exclude_for_alternatives,
-            drug_details_map=drug_details_map,
-        )
-        # Frontend "Class" column displays "class"; send drug name + brand (e.g. Semaglutide (Ozempic)) when in config
-        # "No Change" becomes one row per current drug: "Metformin (No change)", "Sitagliptin (No change)", etc.
+        # Use Claude-generated alternatives only. No fallback to generate_alternatives.
+        alternatives = claude_alternatives if claude_alternatives else []
+        # allDrugWeights "class" column: full display name (e.g. Empagliflozin (Jardiance)).
         drugs_config = config.get("drugs", {})
         all_drug_weights_payload = []
         for e in all_drug_weights:
@@ -556,29 +876,18 @@ def lambda_handler(event, context):
             drug_id = e.get("drug")
             cls = e.get("class")
             if drug_id == "No Change" or cls == "No Change":
-                current_ids = patient.get("current_drug_ids", set())
-                if current_ids:
-                    for did in sorted(current_ids):
-                        row = dict(payload_entry)
-                        row["class"] = _drug_display_name(
-                            {"drug": did, "class": drugs_config.get(did, {}).get("class", did)},
-                            config,
-                        ) + " (No change)"
-                        all_drug_weights_payload.append(row)
-                else:
-                    # Skip "No Change" when patient has no meds - not relevant to show in log
-                    continue
-            else:
-                payload_entry["class"] = _drug_display_name(
-                    {"drug": drug_id, "class": cls},
-                    config,
-                )
-                all_drug_weights_payload.append(payload_entry)
+                continue
+            payload_entry["class"] = _response_display_name(drug_id, cls, config)
+            all_drug_weights_payload.append(payload_entry)
 
         # top3BestOptions = [0] best clinical fit, [1] 2nd best clinical fit (different class), [2] lowest cost (includes top 2 in pool)
         top3_best_options = list(top_two_choices_by_fit) if top_two_choices_by_fit else []
         if not top3_best_options and top_result:
-            med_label = _no_change_medication_label(patient, config) if top_drug_id == "No Change" else str(best_medication.get("medication", ""))
+            if top_drug_id == "No Change":
+                med_label = "Continue " + _no_change_medication_label(patient, config)
+            else:
+                med_display = _response_display_name(top_drug_id, top_class, config)
+                med_label = f"Increase {med_display}" if is_currently_on else f"Start {med_display}"
             dose_label = str(best_medication.get("dose", ""))
             top3_best_options = [{
                 "class": top_class,
@@ -588,23 +897,24 @@ def lambda_handler(event, context):
                 "medication": med_label,
                 "dose": dose_label,
             }]
-        # Add 3rd = cheapest from top 5 clinical fits (no exclusions; show drug name, not "No Change")
+        # Add 3rd = cheapest option among best clinical fit (top 5). Show action prefix (Increase/Start/Continue) + drug name, no dose.
         if cheapest_for_index3 and len(top3_best_options) < 3:
             lc_drug = cheapest_for_index3.get("drug", cheapest_for_index3.get("class"))
-            lc_class = cheapest_for_index3.get("class", "Metformin")
+            lc_class = cheapest_for_index3.get("class") or cheapest_for_index3.get("drug") or ""
             if lc_drug == "No Change" or lc_class == "No Change":
                 no_change_choices = _no_change_choices(patient, config, cheapest_for_index3)
                 if no_change_choices:
                     first = no_change_choices[0]
-                    lc_med_display = first["medication"]
                     lc_drug = first["drug"]
                     lc_class = first["class"]
+                    lc_med_display = _response_display_name(lc_drug, lc_class, config)
+                    lc_med_display = f"Continue {lc_med_display}"
                 else:
                     lc_med_display = "No medication change"
             else:
-                lc_med_display = _drug_display_name(
-                    {"drug": lc_drug, "class": lc_class}, config
-                )
+                lc_med_display = _response_display_name(lc_drug, lc_class, config)
+                is_on_lc_drug, _ = _get_current_med_info_for_dose(patient, lc_drug, lc_class, config)
+                lc_med_display = f"Increase {lc_med_display}" if is_on_lc_drug else f"Start {lc_med_display}"
             top3_best_options.append({
                 "class": lc_class,
                 "drug": lc_drug,
@@ -614,9 +924,35 @@ def lambda_handler(event, context):
                 "dose": "",
             })
 
+        # Build top3BestOptions for response: always use full display name (e.g. "Increase Empagliflozin (Jardiance)") via _response_display_name.
+        top3_for_body = []
+        for opt in top3_best_options:
+            out = dict(opt)
+            if opt.get("drug") and opt.get("drug") != "No Change" and opt.get("class"):
+                full_name = _response_display_name(opt["drug"], opt["class"], config)
+                med = (opt.get("medication") or "").strip()
+                if med.startswith("Increase"):
+                    out["medication"] = f"Increase {full_name}"
+                elif med.startswith("Start"):
+                    out["medication"] = f"Start {full_name}"
+                elif med.startswith("Continue"):
+                    out["medication"] = f"Continue {full_name}"
+                elif med.startswith("Reduce"):
+                    out["medication"] = f"Reduce {full_name}"
+                elif med.startswith("Stop"):
+                    out["medication"] = f"Stop {full_name}"
+                else:
+                    out["medication"] = full_name
+            top3_for_body.append(out)
+
+        # "***see future considerations***": append when Additional Context is not empty (not when AI returns items)
+        additional_context = (request_data.get("additionalContext") or request_data.get("additional_context") or "").strip()
+        if additional_context and "***see future considerations***" not in (assessment or ""):
+            assessment = (assessment or "").rstrip(".") + " ***see future considerations***."
+
         # Build payload; ensure all values are JSON-serializable for API Gateway
-        # top3BestOptions: [0]=best clinical fit, [1]=2nd best clinical fit (different class), [2]=lowest cost (includes top 2)
-        recommendation_timestamp = datetime.now(timezone.utc).isoformat()
+        # top3BestOptions: [0]=best clinical fit, [1]=..., [2]=lowest cost
+        recommendation_timestamp = datetime.now(EASTERN).isoformat()
         body = {
             "assessment": str(assessment) if assessment is not None else "",
             "original_assessment": str(original_assessment),
@@ -624,8 +960,9 @@ def lambda_handler(event, context):
             "alternatives": [str(x) for x in (alternatives or [])],
             "futureConsiderations": [str(x) for x in (future_considerations or [])],
             "allDrugWeights": all_drug_weights_payload,
-            "top3BestOptions": top3_best_options,
+            "top3BestOptions": top3_for_body,
             "recommendationTimestamp": recommendation_timestamp,
+            "warning-eGFR": _eGFR_therapy_warning(patient, config),
         }
         if context and getattr(context, "aws_request_id", None):
             body["requestId"] = context.aws_request_id

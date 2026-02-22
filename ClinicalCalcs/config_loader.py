@@ -1,5 +1,5 @@
 """
-Load drug_classes.json (includes Goal 1: current_therapy_boost), goal2.json, goal3.json from S3 or local.
+Load drug_classes.json (includes Goal 1: current_therapy_boost), dosing_config.json, glucose_targets.json from S3 or local.
 Caches in Lambda execution context. Used by lambda_handler.
 """
 import json
@@ -19,6 +19,7 @@ S3_CONFIG = Config(connect_timeout=5, read_timeout=10, retries={"max_attempts": 
 CONFIG_LOADER_VERSION = "2026-01-30-flush"  # log this to confirm deployed code
 
 _drug_classes_raw_cache = None
+_drug_config_cache = None
 _goal1_cache = None
 _goal2_cache = None
 _goal3_cache = None
@@ -89,7 +90,7 @@ def load_goal1():
     # Ensure drug_classes.json is loaded (populates _drug_classes_raw_cache)
     load_drug_classes()
     _goal1_cache = {
-        "current_therapy_boost": _drug_classes_raw_cache.get("current_therapy_boost", 0.20),
+        "current_therapy_boost": _drug_classes_raw_cache.get("current_therapy_boost"),
         "description": _drug_classes_raw_cache.get("description", ""),
     }
     return _goal1_cache
@@ -109,66 +110,134 @@ def _load_json_from_s3(bucket_name, object_key):
 
 
 def load_goal2():
-    """Load goal2.json: try local first, then S3. Cached."""
+    """Load dosing config (dosing_config.json): try S3 first (if bucket set), then local. Cached."""
     global _goal2_cache
     if _goal2_cache is not None:
         return _goal2_cache
-    _goal2_cache = _load_json_local("goal2.json")
-    if _goal2_cache is not None:
-        _log("Goal2 loaded from local")
-        return _goal2_cache
     bucket = os.environ.get("DRUG_CLASSES_S3_BUCKET")
-    key = os.environ.get("GOAL2_S3_KEY", "goal2.json")
+    key = os.environ.get("GOAL2_S3_KEY", "dosing_config.json")
     if bucket and boto3:
-        _log(f"Loading goal2 from S3: s3://{bucket}/{key}")
+        _log(f"Loading dosing config from S3: s3://{bucket}/{key}")
         _goal2_cache = _load_json_from_s3(bucket, key)
-    _log("Goal2 loaded" if _goal2_cache else "Goal2 missing (using fallbacks)")
+    if _goal2_cache is None:
+        _goal2_cache = _load_json_local("dosing_config.json")
+        if _goal2_cache is not None:
+            _log("Goal2 loaded from local (S3 skipped or failed)")
+    _log("Goal2 loaded" if _goal2_cache else "Goal2 missing")
     return _goal2_cache or {}
 
 
 def load_goal3():
-    """Load goal3.json: try local first, then S3. Cached."""
+    """Load glucose targets (glucose_targets.json): try S3 first (if bucket set), then local. Cached."""
     global _goal3_cache
     if _goal3_cache is not None:
         return _goal3_cache
-    _goal3_cache = _load_json_local("goal3.json")
-    if _goal3_cache is not None:
-        _log("Goal3 loaded from local")
-        return _goal3_cache
     bucket = os.environ.get("DRUG_CLASSES_S3_BUCKET")
-    key = os.environ.get("GOAL3_S3_KEY", "goal3.json")
+    key = os.environ.get("GOAL3_S3_KEY", "glucose_targets.json")
     if bucket and boto3:
-        _log(f"Loading goal3 from S3: s3://{bucket}/{key}")
+        _log(f"Loading glucose targets from S3: s3://{bucket}/{key}")
         _goal3_cache = _load_json_from_s3(bucket, key)
-    _log("Goal3 loaded" if _goal3_cache else "Goal3 missing (using fallbacks)")
+    if _goal3_cache is None:
+        _goal3_cache = _load_json_local("glucose_targets.json")
+        if _goal3_cache is not None:
+            _log("Goal3 loaded from local (S3 skipped or failed)")
+    _log("Goal3 loaded" if _goal3_cache else "Goal3 missing")
     return _goal3_cache or {}
 
 
-def load_drug_classes(s3_bucket=None, s3_key=None):
-    """Load drug config: try LOCAL first, then S3. Cached. Returns {classes, drugs}.
-    classes = insurance-only (cost, tier, va_pdf_exists, pa_required, base_access_score, allergy_labels).
-    drugs = rule set per drug (class, clinical_base, deny_if, caution_if, clinical_boost)."""
-    global _drug_classes_raw_cache
-    if _drug_classes_raw_cache is not None:
-        return _normalize_drug_config(_drug_classes_raw_cache)
-    # Prefer local package so Lambda works without S3 / network (no 502 from S3 hang)
-    if _drug_classes_local_path():
-        _log("Loading drug classes from local package")
-        _drug_classes_raw_cache = load_drug_classes_from_local()
-        return _normalize_drug_config(_drug_classes_raw_cache)
-    bucket = s3_bucket or os.environ.get("DRUG_CLASSES_S3_BUCKET")
-    key = s3_key or os.environ.get("DRUG_CLASSES_S3_KEY", "drug_classes.json")
+def _load_drug_costs():
+    """Load drug_costs.json: try S3 first (same bucket, COSTS_S3_KEY or DRUG_COSTS_S3_KEY), then local. Returns None if not found."""
+    bucket = os.environ.get("DRUG_CLASSES_S3_BUCKET")
+    key = os.environ.get("COSTS_S3_KEY") or os.environ.get("DRUG_COSTS_S3_KEY", "drug_costs.json")
     if bucket and boto3:
-        try:
-            _log(f"Loading drug classes from S3: s3://{bucket}/{key}")
-            _drug_classes_raw_cache = load_drug_classes_from_s3(bucket, key)
-            return _normalize_drug_config(_drug_classes_raw_cache)
-        except Exception as e:
-            _log(f"Failed to load from S3: {e}")
-            raise
-    _log("Loading drug classes from local package (no S3 env)")
-    _drug_classes_raw_cache = load_drug_classes_from_local()
-    return _normalize_drug_config(_drug_classes_raw_cache)
+        data = _load_json_from_s3(bucket, key)
+        if data is not None:
+            _log(f"drug_costs.json loaded from S3: s3://{bucket}/{key}")
+            return data
+    data = _load_json_local("drug_costs.json")
+    if data is not None:
+        _log("drug_costs.json loaded from local (S3 skipped or failed)")
+    return data
+
+
+def load_drug_classes(s3_bucket=None, s3_key=None):
+    """Load drug config: try S3 first (if DRUG_CLASSES_S3_BUCKET set), then local. Cached. Returns {classes, drugs}.
+    classes = insurance-only (cost, tier, va_pdf_exists, pa_required, base_access_score, allergy_labels).
+    drugs = rule set per drug (class, clinical_base, deny_if, caution_if, clinical_boost).
+    If drug_costs.json exists (S3 or local), its by_class/by_drug cost/tier override class defaults."""
+    global _drug_classes_raw_cache, _drug_config_cache
+    if _drug_config_cache is not None:
+        return _drug_config_cache
+    if _drug_classes_raw_cache is None:
+        bucket = s3_bucket or os.environ.get("DRUG_CLASSES_S3_BUCKET")
+        key = s3_key or os.environ.get("DRUG_CLASSES_S3_KEY", "drug_classes.json")
+        if bucket and boto3:
+            try:
+                _log(f"Loading drug classes from S3: s3://{bucket}/{key}")
+                _drug_classes_raw_cache = load_drug_classes_from_s3(bucket, key)
+            except Exception as e:
+                _log(f"Failed to load drug_classes from S3: {e}, falling back to local")
+                _drug_classes_raw_cache = None
+        if _drug_classes_raw_cache is None:
+            if _drug_classes_local_path():
+                _log("Loading drug classes from local package")
+                _drug_classes_raw_cache = load_drug_classes_from_local()
+            else:
+                raise FileNotFoundError("drug_classes.json not found in S3 or local package")
+    config = _normalize_drug_config(_drug_classes_raw_cache)
+    drug_costs = _load_drug_costs()
+    if drug_costs and drug_costs.get("by_class"):
+        _apply_drug_costs(config, drug_costs["by_class"])
+        _log("drug_costs.json applied for cost/tier (cheapest-in-class and coverage)")
+    if drug_costs and drug_costs.get("by_drug"):
+        _apply_drug_costs_by_drug(config, drug_costs["by_drug"])
+        _log("drug_costs.json by_drug applied (drug-level cost/tier)")
+    _drug_config_cache = config
+    return _drug_config_cache
+
+
+def _apply_drug_costs(config, by_class):
+    """Override cost/tier in config from drug_costs.json by_class. Used for cheapest-in-class and coverage scoring."""
+    if not by_class or not isinstance(by_class, dict):
+        return
+    for drug_id, data in config.get("drugs", {}).items():
+        cls = data.get("class", drug_id)
+        if cls in by_class:
+            ov = by_class[cls]
+            if isinstance(ov, dict):
+                if "cost" in ov:
+                    data["cost"] = ov["cost"]
+                if "tier" in ov:
+                    data["tier"] = ov["tier"]
+                if "price_per_month" in ov:
+                    data["price_per_month"] = ov["price_per_month"]
+    for cls, class_data in config.get("classes", {}).items():
+        if cls in by_class:
+            ov = by_class[cls]
+            if isinstance(ov, dict):
+                if "cost" in ov:
+                    class_data["cost"] = ov["cost"]
+                if "tier" in ov:
+                    class_data["tier"] = ov["tier"]
+                if "price_per_month" in ov:
+                    class_data["price_per_month"] = ov["price_per_month"]
+
+
+def _apply_drug_costs_by_drug(config, by_drug):
+    """Override cost/tier per drug from drug_costs.json by_drug. Applied after by_class so drug-level wins."""
+    if not by_drug or not isinstance(by_drug, dict):
+        return
+    for drug_id, data in config.get("drugs", {}).items():
+        if drug_id not in by_drug:
+            continue
+        ov = by_drug[drug_id]
+        if isinstance(ov, dict):
+            if "cost" in ov:
+                data["cost"] = ov["cost"]
+            if "tier" in ov:
+                data["tier"] = ov["tier"]
+            if "price_per_month" in ov:
+                data["price_per_month"] = ov["price_per_month"]
 
 
 def _normalize_drug_config(raw):
@@ -184,13 +253,15 @@ def _normalize_drug_config(raw):
             drug_allergy = data.get("allergy_labels") or []
             merged_allergy = list(dict.fromkeys(class_allergy + drug_allergy))  # order preserved, deduped
             merged = {
-                "cost": class_data.get("cost", "medium"),
-                "tier": class_data.get("tier", 2),
+                "cost": class_data.get("cost"),
+                "tier": class_data.get("tier"),
                 "va_pdf_exists": class_data.get("va_pdf_exists", False),
                 "pa_required": class_data.get("pa_required", False),
                 "base_access_score": class_data.get("base_access_score", 0.6),
                 "allergy_labels": merged_allergy,
             }
+            if class_data.get("price_per_month") is not None:
+                merged["price_per_month"] = class_data["price_per_month"]
             merged.update(data)  # drug overrides (cost, rules, etc.)
             merged["allergy_labels"] = merged_allergy  # keep union; update() may have overwritten with drug-only
             drugs_out[drug_id] = merged
@@ -205,8 +276,8 @@ def _normalize_drug_config(raw):
         if not isinstance(data, dict):
             continue
         classes[cls_name] = {
-            "cost": data.get("cost", "medium"),
-            "tier": data.get("tier", 2),
+            "cost": data.get("cost"),
+            "tier": data.get("tier"),
             "va_pdf_exists": data.get("va_pdf_exists", False),
             "pa_required": data.get("pa_required", False),
             "base_access_score": data.get("base_access_score", 0.6),

@@ -46,6 +46,18 @@ def build_drug_name_to_id(goal2_data, config):
                 if paren:
                     name_to_drug_id[paren.group(1).strip()] = drug_id
             name_to_drug_id[drug_id] = drug_id
+    # From drug_classes: display_name (e.g. "Semaglutide (Ozempic)", "Empagliflozin (Jardiance)") -> drug_id
+    # so frontend-sent names match and Semaglutide vs Semaglutide Oral resolve by full name or brand.
+    # Only add full display and brand (not first word) to avoid overwriting goal2 first-word mappings.
+    for did, data in (config.get("drugs") or {}).items():
+        if not isinstance(data, dict):
+            continue
+        display = (data.get("display_name") or "").strip()
+        if display:
+            name_to_drug_id[display] = did
+            paren = re.search(r"\(([^)]+)\)", display)
+            if paren:
+                name_to_drug_id[paren.group(1).strip()] = did
     # Default medication -> drug_id for classes without by_drug (Metformin, TZD, Basal, Bolus)
     for class_name, default_cfg in default_meds.items():
         if not isinstance(default_cfg, dict):
@@ -79,18 +91,6 @@ def form_value_to_class_mapping(goal2_data):
     return {v: k for k, v in goal2_data["form_value_by_class"].items()}
 
 
-DRUG_CLASS_MAPPING_FALLBACK = {
-    "biguanides": "Metformin",
-    "sglt2": "SGLT2",
-    "glp1_gip": "GLP1",
-    "tzd": "TZD",
-    "dppiv": "DPP4",
-    "sulfonylureas": "Sulfonylurea",
-    "basal_insulin": "Basal Insulin",
-    "bolus_insulin": "Bolus Insulin",
-    "pramlintide": "Pramlintide",
-}
-
 COMORBIDITY_MAPPING = {
     "Heart Failure (CHF)": "Heart Failure (CHF)",
     "ASCVD": "ASCVD",
@@ -117,11 +117,10 @@ COMORBIDITY_MAPPING = {
 
 
 def _normalize_request(request_data):
-    """Accept frontend payload: prefer camelCase, fall back to snake_case so Lambda works with either."""
+    """Normalize request: frontend sends patientInfo, currentMedications, etc. (snake_case in patientInfo)."""
     if not request_data or not isinstance(request_data, dict):
         return request_data or {}
     out = dict(request_data)
-    # Top-level: camelCase (frontend) vs snake_case
     if "patient_info" in out and "patientInfo" not in out:
         out["patientInfo"] = out["patient_info"]
     if "current_medications" in out and "currentMedications" not in out:
@@ -159,23 +158,26 @@ def transform_request_to_patient(request_data, drug_classes=None, goal2_data=Non
     last_a1c_str = str(patient_info.get("lastA1c") or "0").strip().rstrip("%").strip()
     patient["a1c"] = float(last_a1c_str) if last_a1c_str else 0.0
 
-    insurance_plan = (patient_info.get("insurancePlan") or "").lower()
-    if "va" in insurance_plan or "veteran" in insurance_plan:
-        patient["insurance"] = "VA"
-    elif "medicare" in insurance_plan:
-        patient["insurance"] = "Medicare"
-    elif "medicaid" in insurance_plan:
-        patient["insurance"] = "Medicaid"
-    elif "no insurance" in insurance_plan or "uninsured" in insurance_plan:
+    # insurance_tier: uninsured | medicaid_medicare | private (from frontend)
+    tier = (patient_info.get("insurance_tier") or "").strip().lower()
+    if tier == "uninsured":
         patient["insurance"] = "No Insurance"
+    elif tier == "medicaid_medicare":
+        patient["insurance"] = "Medicaid"
+    elif tier == "private":
+        patient["insurance"] = "Private"
     else:
         patient["insurance"] = "Private"
+
+    # can_afford_copay: only when uninsured; used by handler for affordability gate
+    copay = patient_info.get("can_afford_copay")
+    patient["can_afford_copay"] = copay if isinstance(copay, bool) else None
 
     monitor = (patient_info.get("monitoringMethod") or "").lower()
     patient["monitor"] = "CGM" if "cgm" in monitor else "fingerstick"
 
     mapping = form_value_to_class_mapping(goal2_data) if goal2_data else None
-    mapping = mapping or DRUG_CLASS_MAPPING_FALLBACK
+    # No fallback: use only goal2 form_value_by_class to map form class to internal class
     name_to_drug_id, class_to_default_drug_id = build_drug_name_to_id(goal2_data, drug_classes)
     current_meds = request_data.get("currentMedications", [])
     patient["current_classes"] = []
@@ -185,6 +187,8 @@ def transform_request_to_patient(request_data, drug_classes=None, goal2_data=Non
 
     for med in current_meds:
         form_class = med.get("drugClass", "").lower()
+        if not mapping:
+            continue
         drug_class = mapping.get(form_class)
         if drug_class:
             patient["current_classes"].append(drug_class)
@@ -193,7 +197,9 @@ def transform_request_to_patient(request_data, drug_classes=None, goal2_data=Non
             frequency = med.get("frequency", "")
             if drug_name:
                 patient["current_drugs"][drug_class] = f"{drug_name} {dose} {frequency}"
-            # Resolve to config drug_id (drug-level: current_medication_info and current_drug_ids by drug_id)
+            # Resolve to config drug_id only when the drug name maps to a drug in config.
+            # No fallback to class default: if the medication isn't in config, we don't add a drug_id
+            # (avoids e.g. mapping Empagliflozin -> Dapagliflozin when Empagliflozin is missing).
             drug_id = None
             if drug_name:
                 drug_id = name_to_drug_id.get(drug_name) or name_to_drug_id.get(drug_name.split()[0] if drug_name else "")
@@ -201,14 +207,6 @@ def transform_request_to_patient(request_data, drug_classes=None, goal2_data=Non
                     brand = re.search(r"\(([^)]+)\)", drug_name)
                     if brand:
                         drug_id = name_to_drug_id.get(brand.group(1).strip())
-            if not drug_id:
-                drug_id = class_to_default_drug_id.get(drug_class)
-            if not drug_id and drug_class:
-                drugs_cfg = (drug_classes or {}).get("drugs", {}) if isinstance(drug_classes, dict) else {}
-                for did, d in drugs_cfg.items():
-                    if isinstance(d, dict) and d.get("class") == drug_class:
-                        drug_id = did
-                        break
             if drug_id:
                 current_drug_ids_set.add(drug_id)
                 info = {

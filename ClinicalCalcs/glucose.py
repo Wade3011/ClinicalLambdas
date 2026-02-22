@@ -1,15 +1,8 @@
 """
 Goal 3: Potency check (can drug lower fasting/post-prandial to target?).
 goal_bands, A1c estimation tables, potency, finger_poke_interpret, calculate_goal3_boost.
-Uses goal3.json when goal3_data provided.
+Uses glucose_targets.json when goal3_data provided. No non-S3 fallbacks.
 """
-# Bands by A1c goal (fallback when goal3.json missing). ADA targets, no buffer.
-FINGER_POKE_BANDS_FALLBACK = {
-    "lt7": {"fasting": {"reduce_below": 80, "ok_min": 80, "ok_max": 120, "increase_at": 121}, "post_prandial": {"reduce_below": 100, "ok_min": 100, "ok_max": 180, "increase_at": 181}},
-    "lt7_5": {"fasting": {"reduce_below": 80, "ok_min": 80, "ok_max": 130, "increase_at": 131}, "post_prandial": {"reduce_below": 100, "ok_min": 100, "ok_max": 190, "increase_at": 191}},
-    "lt8": {"fasting": {"reduce_below": 90, "ok_min": 90, "ok_max": 150, "increase_at": 151}, "post_prandial": {"reduce_below": 100, "ok_min": 100, "ok_max": 200, "increase_at": 201}},
-}
-
 # Aligned with A1c Config CSV (A1c --> Fasting Avg Config). Typo fixes: 6.9 PP 11->151, 9.4 PP 23->223.
 FASTING_ESTIMATION_TABLE = {
     6.5: 120.0, 6.6: 123.3, 6.7: 126.7, 6.8: 130.0, 6.9: 133.3,
@@ -56,15 +49,20 @@ def _get_finger_poke_band(goal):
 
 
 def goal3_bands(goal3_data):
-    """Return goal_bands from goal3_data or fallback."""
-    return (goal3_data or {}).get("goal_bands") or FINGER_POKE_BANDS_FALLBACK
+    """Return goal_bands from goal3_data. None when missing (no fallback)."""
+    return (goal3_data or {}).get("goal_bands")
 
 
 def finger_poke_interpret(goal, fasting_avg, post_pp_avg, goal3_data=None):
     """Interpret fasting/post-prandial per Finger Poke Rules. Returns {fasting, post_prandial, band}."""
     band_key = _get_finger_poke_band(goal)
-    bands = goal3_bands(goal3_data)[band_key]
     out = {"band": band_key}
+    bands_all = goal3_bands(goal3_data)
+    if bands_all is None:
+        return {**out, "fasting": None, "post_prandial": None}
+    bands = bands_all.get(band_key)
+    if bands is None:
+        return {**out, "fasting": None, "post_prandial": None}
 
     def _interpret(value, band):
         if value is None:
@@ -78,8 +76,8 @@ def finger_poke_interpret(goal, fasting_avg, post_pp_avg, goal3_data=None):
             return "increase"
         return "no_change"
 
-    out["fasting"] = _interpret(fasting_avg, bands["fasting"]) if fasting_avg is not None else None
-    out["post_prandial"] = _interpret(post_pp_avg, bands["post_prandial"]) if post_pp_avg is not None else None
+    out["fasting"] = _interpret(fasting_avg, bands["fasting"]) if fasting_avg is not None and bands.get("fasting") else None
+    out["post_prandial"] = _interpret(post_pp_avg, bands["post_prandial"]) if post_pp_avg is not None and bands.get("post_prandial") else None
     return out
 
 
@@ -125,28 +123,34 @@ def estimate_post_prandial_from_a1c(a1c, goal3_data=None):
 
 
 def get_target_fasting(goal, goal3_data=None):
-    """Target fasting (mg/dl) for A1c goal. Uses goal3 goal_bands when provided."""
+    """Target fasting (mg/dl) for A1c goal. Uses goal3 goal_bands when provided. None when missing."""
+    bands = goal3_bands(goal3_data)
+    if bands is None:
+        return None
     band_key = _get_finger_poke_band(goal)
-    return goal3_bands(goal3_data)[band_key]["fasting"]["ok_max"]
+    b = bands.get(band_key, {}).get("fasting", {})
+    return b.get("ok_max")
 
 
 def get_target_post_prandial(goal, goal3_data=None):
-    """Target post-prandial (mg/dl) for A1c goal. Uses goal3 goal_bands when provided."""
+    """Target post-prandial (mg/dl) for A1c goal. Uses goal3 goal_bands when provided. None when missing."""
+    bands = goal3_bands(goal3_data)
+    if bands is None:
+        return None
     band_key = _get_finger_poke_band(goal)
-    return goal3_bands(goal3_data)[band_key]["post_prandial"]["ok_max"]
+    b = bands.get(band_key, {}).get("post_prandial", {})
+    return b.get("ok_max")
 
 
 def _potency_for_drug(drug_id, drug_class, goal3_data, on_therapy=False):
-    """Get potency (fasting, post_prandial) for a drug: potency_by_drug then potency_by_class fallback."""
+    """Get potency (fasting, post_prandial) for a drug from goal3 only. No by_class fallback."""
     g = goal3_data or {}
     if on_therapy:
         by_drug = g.get("potency_on_therapy_by_drug") or {}
-        by_class = g.get("potency_on_therapy_by_class") or {}
-        p = by_drug.get(drug_id) or by_class.get(drug_class, {})
+        p = by_drug.get(drug_id)
     else:
         by_drug = g.get("potency_by_drug") or {}
-        by_class = g.get("potency_by_class") or {}
-        p = by_drug.get(drug_id) or by_class.get(drug_class, {})
+        p = by_drug.get(drug_id)
     return p if isinstance(p, dict) else {}
 
 
@@ -166,27 +170,22 @@ def calculate_goal3_boost(drug_id, drug_class, patient, normalized_glucose, goal
     p = _potency_for_drug(drug_id, drug_class, goal3_data, on_therapy=is_currently_on)
     fasting_potential = p.get("fasting")
     post_pp_potential = p.get("post_prandial")
-    if is_currently_on:
-        if fasting_potential is None:
-            fasting_potential = FASTING_LOWERING_POTENTIAL.get(drug_class, 0) * 0.5
-        if post_pp_potential is None:
-            post_pp_potential = POST_PRANDIAL_LOWERING_POTENTIAL.get(drug_class, 0) * 0.5
-    else:
-        if fasting_potential is None:
-            fasting_potential = FASTING_LOWERING_POTENTIAL.get(drug_class, 0)
-        if post_pp_potential is None:
-            post_pp_potential = POST_PRANDIAL_LOWERING_POTENTIAL.get(drug_class, 0)
+    # No fallback: use only goal3 potency. When missing, 0 so no boost from that axis.
+    if fasting_potential is None:
+        fasting_potential = 0
+    if post_pp_potential is None:
+        post_pp_potential = 0
 
     # Per Goal 3: Value = (glucose average - potency). IF Value > Target = 0, IF Value <= Target = +0.05
     # Fasting: value = fasting_avg - fasting_potential
     fasting_score = 0.0
-    if fasting_current is not None:
+    if fasting_current is not None and target_fasting is not None:
         value_after_fasting = fasting_current - (fasting_potential or 0)
         fasting_score = 0.05 if value_after_fasting <= target_fasting else 0.0
 
     # Post-prandial: value = post_prandial_avg - post_prandial_potential
     post_pp_score = 0.0
-    if post_pp_current is not None:
+    if post_pp_current is not None and target_post_prandial is not None:
         value_after_pp = post_pp_current - (post_pp_potential or 0)  # average - potency
         post_pp_score = 0.05 if value_after_pp <= target_post_prandial else 0.0
 
@@ -220,24 +219,14 @@ def get_goal3_boost_breakdown(drug_id, drug_class, patient, normalized_glucose, 
     target_fasting = get_target_fasting(goal, goal3_data)
     target_post_prandial = get_target_post_prandial(goal, goal3_data)
     p = _potency_for_drug(drug_id, drug_class, goal3_data, on_therapy=is_currently_on)
-    fasting_potential = p.get("fasting")
-    post_pp_potential = p.get("post_prandial")
-    if is_currently_on:
-        if fasting_potential is None:
-            fasting_potential = FASTING_LOWERING_POTENTIAL.get(drug_class, 0) * 0.5
-        if post_pp_potential is None:
-            post_pp_potential = POST_PRANDIAL_LOWERING_POTENTIAL.get(drug_class, 0) * 0.5
-    else:
-        if fasting_potential is None:
-            fasting_potential = FASTING_LOWERING_POTENTIAL.get(drug_class, 0)
-        if post_pp_potential is None:
-            post_pp_potential = POST_PRANDIAL_LOWERING_POTENTIAL.get(drug_class, 0)
+    fasting_potential = p.get("fasting") if p.get("fasting") is not None else 0
+    post_pp_potential = p.get("post_prandial") if p.get("post_prandial") is not None else 0
 
-    if fasting_current is not None:
+    if fasting_current is not None and target_fasting is not None:
         value_after = fasting_current - (fasting_potential or 0)
         out["goal3_fasting"] = 0.05 if value_after <= target_fasting else 0.0
     # Post-prandial: value = post_prandial_avg - potency; if value <= target → +0.05
-    if post_pp_current is not None:
+    if post_pp_current is not None and target_post_prandial is not None:
         value_after = post_pp_current - (post_pp_potential or 0)
         out["goal3_post_prandial"] = 0.05 if value_after <= target_post_prandial else 0.0
 

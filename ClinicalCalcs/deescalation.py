@@ -113,29 +113,31 @@ def _sulfonylurea_suggestion(drug_id, dose_str):
 
 
 def _basal_insulin_suggestion(drug_id, dose_str):
-    """Handout 1.2/2.5: 21+ -> reduce 20%; 10-20 -> cut in half; <10 -> stop."""
+    """Handout 1.2/2.5: 21+ -> reduce 20%; 10-20 -> cut in half; <10 -> stop. Uses drug_id for display (e.g. Glargine)."""
     units = _parse_insulin_units(dose_str)
+    label = drug_id or "Basal Insulin"
     if units is None:
-        return drug_id or "Basal Insulin", "Consider dose reduction per handout"
+        return "Reduce " + label, "Consider dose reduction per handout"
     if units >= 21:
         new_val = round(units * 0.8, 0)
-        return drug_id or "Basal Insulin", f"Reduce total daily dose by 20% (e.g. to ~{int(new_val)} units)"
+        return "Reduce " + label, f"Reduce total daily dose by 20% (e.g. to ~{int(new_val)} units)"
     if units >= 10:
-        return drug_id or "Basal Insulin", f"Cut dose in half (from {units} units)"
-    return drug_id or "Basal Insulin", "Less than 10 units per handout"
+        return "Reduce " + label, f"Cut dose in half (from {units} units)"
+    return "Stop " + label, "Less than 10 units per handout"
 
 
 def _bolus_insulin_suggestion(drug_id, dose_str):
-    """Handout 2.1: 15+ -> reduce 20%; 6-14 -> cut in half; ≤5 -> stop."""
+    """Handout 2.1: 15+ -> reduce 20%; 6-14 -> cut in half; ≤5 -> stop. Uses drug_id for display (e.g. Lispro)."""
     units = _parse_insulin_units(dose_str)
+    label = drug_id or "Bolus Insulin"
     if units is None:
-        return "Reduce Bolus Insulin", "Consider dose reduction per handout"
+        return "Reduce " + label, "Consider dose reduction per handout"
     if units >= 15:
         new_val = round(units * 0.8, 0)
-        return "Reduce Bolus Insulin", f"Reduce total daily dose by 20% (e.g. to ~{int(new_val)} units)"
+        return "Reduce " + label, f"Reduce total daily dose by 20% (e.g. to ~{int(new_val)} units)"
     if units >= 6:
-        return "Reduce Bolus Insulin", f"Cut dose in half (from {units} units)"
-    return "Stop Bolus Insulin", "5 units or less per handout"
+        return "Reduce " + label, f"Cut dose in half (from {units} units)"
+    return "Stop " + label, "5 units or less per handout"
 
 
 def _pioglitazone_suggestion(drug_id, dose_str):
@@ -149,13 +151,14 @@ def _pioglitazone_suggestion(drug_id, dose_str):
 
 
 def _metformin_suggestion(drug_id, dose_str):
-    """Handout: cut in half or stop if 500 mg."""
+    """Handout: cut in half or stop if 500 mg. No fallback: use drug_id only (frontend sends required data)."""
     val, _ = _parse_dose_mg(dose_str)
+    med = drug_id if drug_id else ""
     if val is None:
-        return drug_id or "Metformin", "Cut dose in half or stop"
+        return med, "Cut dose in half or stop"
     if val <= 500:
-        return drug_id or "Metformin", "At 500 mg per handout"
-    return drug_id or "Metformin", "Cut dose in half or stop"
+        return med, "At 500 mg per handout"
+    return med, "Cut dose in half or stop"
 
 
 def _glp1_suggestion(drug_id, dose_str):
@@ -218,13 +221,15 @@ def _get_reduction_suggestion(drug_id, drug_class, med_info, overnight, daytime,
 
 def _get_priority_and_fallback(overnight, daytime):
     """Return (priority_classes, fallback_classes). Priority = reduce first if present.
-    Fallback = only when neither priority class is present. Per handout."""
+    Fallback = only when neither priority class is present. Per handout.
+    Daytime-only lows: prioritize mealtime/bolus only; exclude basal (lows not overnight)."""
     if overnight:
         priority = ["Sulfonylurea", "Basal Insulin"]
         fallback = ["TZD", "Metformin", "GLP1", "DPP4", "Bolus Insulin", "SGLT2"]
         return priority, fallback
     if daytime:
-        priority = ["Bolus Insulin", "TZD", "Sulfonylurea", "GLP1", "Basal Insulin"]
+        # Daytime-only lows: focus on mealtime/bolus (and other daytime drivers). Do not suggest basal reduction.
+        priority = ["Bolus Insulin", "TZD", "Sulfonylurea", "GLP1"]
         fallback = ["DPP4", "Metformin", "SGLT2"]
         return priority, fallback
     priority = ["Sulfonylurea", "Basal Insulin", "Bolus Insulin"]
@@ -257,7 +262,7 @@ def _build_maintain_options(patient, config, reduce_classes):
             "drug": drug_id,
             "clinical_fit": 1.0,
             "coverage": 1.0,
-            "medication": f"Maintain {display_name}",
+            "medication": f"Continue {display_name}",
             "dose": dose_display or "at current dose",
         })
     return maint
@@ -284,9 +289,9 @@ def get_deescalation_recommendations(patient, normalized_glucose, config):
                 return True
         return False
 
-    # Per handout: reduce priority classes if present; otherwise use fallback list
+    # Per handout: reduce priority classes if present. No fallback list when none present.
     has_any_priority = any(_patient_has_class(c) for c in priority_classes)
-    classes_to_reduce = priority_classes if has_any_priority else fallback_classes
+    classes_to_reduce = priority_classes if has_any_priority else []
 
     reduce_options = []
     reduce_classes = []

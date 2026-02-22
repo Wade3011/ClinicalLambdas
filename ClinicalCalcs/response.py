@@ -94,29 +94,20 @@ def generate_rationale(patient, result, drug_data):
 
 
 def _drug_display_name(alt, config=None):
-    """Return drug name for display; include brand (display_name) when present in config.
-    When display_name is a full medication string (e.g. 'Glargine (Lantus)'), return it as-is
-    so the ranking table shows drug name instead of class name (e.g. Basal Insulin -> Glargine (Lantus))."""
+    """Return drug name for display with brand in parentheses (e.g. 'Empagliflozin (Jardiance)'). No stripping."""
     display = alt.get("drug") or alt.get("class") or "Other"
     cls = alt.get("class")
     drugs = (config.get("drugs", {}) if config and isinstance(config, dict) else {}) or {}
-    # If we have a drug id, check for display_name (e.g. Semaglutide -> Ozempic, or Basal Insulin -> Glargine (Lantus))
     if alt.get("drug") and display in drugs:
         data = drugs.get(display)
         if isinstance(data, dict) and data.get("display_name"):
-            dname = data["display_name"]
-            # Full medication string (contains parens): use as-is so table shows drug name not class
-            if "(" in (dname or ""):
-                return dname
-            return f"{display} ({dname})"
+            return data["display_name"]
+        return display
     if config and cls and (display == cls or not alt.get("drug")):
         for drug_id, data in drugs.items():
             if isinstance(data, dict) and data.get("class") == cls:
                 if data.get("display_name"):
-                    dname = data["display_name"]
-                    if "(" in (dname or ""):
-                        return dname
-                    return f"{drug_id} ({dname})"
+                    return data["display_name"]
                 return drug_id
     return display
 
@@ -172,14 +163,40 @@ def generate_alternatives(results, top_class, top_drug_id=None, config=None, exc
     return alternatives
 
 
+def _cost_tier_display(drug_data):
+    """Format cost tier line; append ~$X/month when price_per_month present. No fallback."""
+    if not drug_data or not isinstance(drug_data, dict):
+        return ""
+    tier = drug_data.get("tier")
+    cost = drug_data.get("cost")
+    line = f"{tier or ''} ({cost or ''} cost)"
+    try:
+        p = drug_data.get("price_per_month")
+        if p is not None and (isinstance(p, (int, float)) or (isinstance(p, str) and p.strip())):
+            line += f" ~${float(p):.0f}/month"
+    except (TypeError, ValueError):
+        pass
+    return line
+
+
 def _cost_score(result, drugs):
-    """Lower is cheaper. drugs = config['drugs'] (drug-level cost/tier)."""
+    """Lower is cheaper. Uses price_per_month when present, else tier/cost. drugs = config['drugs']."""
     drug_id = result.get("drug", result.get("class"))
     data = drugs.get(drug_id, {}) if isinstance(drugs, dict) else {}
-    tier = data.get("tier", 3)
-    cost = data.get("cost", "medium")
+    price = data.get("price_per_month")
+    try:
+        price = float(price) if price is not None else None
+    except (TypeError, ValueError):
+        price = None
+    tier = data.get("tier")
+    cost = data.get("cost")
     cost_vals = {"low": 1, "medium": 2, "high": 3, "very_high": 4}
-    return (tier, cost_vals.get(cost, 2))
+    # No fallback: missing cost/tier sorts last (high sentinel for sort key only)
+    cost_ord = cost_vals.get(cost) if cost is not None else 99
+    tier_ord = tier if tier is not None else 99
+    if price is not None:
+        return (price, tier_ord, cost_ord)
+    return (float("inf"), tier_ord, cost_ord)
 
 
 def find_lowest_cost_option(results, config_or_classes):
@@ -319,12 +336,27 @@ def _granular_allergy_clarification(allergies_list):
     return " ALLERGY CLARIFICATION (for other_options_not_preferred): " + " ".join(parts)
 
 
-def build_claude_prompt(request_data, results, drug_classes, patient, alternative_drug_names=None, top_two_results=None, lowest_cost_result=None, is_deescalation=False, a1c_above_goal=False, assessment=""):
+def _insurance_display(patient_info):
+    """Return insurance label for Claude prompt from insurance_tier (frontend). No fallback."""
+    if not patient_info or not isinstance(patient_info, dict):
+        return ""
+    tier = (patient_info.get("insurance_tier") or "").strip().lower()
+    if tier == "uninsured":
+        return "Uninsured"
+    if tier == "medicaid_medicare":
+        return "Medicaid / Medicare"
+    if tier == "private":
+        return "Private Insurance"
+    return ""
+
+
+def build_claude_prompt(request_data, results, drug_classes, patient, alternative_drug_names=None, top_two_results=None, lowest_cost_result=None, is_deescalation=False, a1c_above_goal=False, assessment="", kb_references_section=None):
     """Build system and user prompt for Claude API. Uses top_two_results when provided (the displayed #1 and #2).
     lowest_cost_result is the lowest cost option to determine if best_cost_explanation should be included.
     assessment is the pre-computed clinical assessment text; Claude may return an updated version.
     is_deescalation=True: top options are reduce/maintain; explain why these are recommended per de-escalation rules.
-    a1c_above_goal=True: when in de-escalation, A1C is above goal; future_considerations should include Metformin increase or add-on after reduction."""
+    a1c_above_goal=True: when in de-escalation, A1C is above goal; future_considerations should include Metformin increase or add-on after reduction.
+    kb_references_section: if provided (e.g. from Bedrock Knowledge Base retrieval), appended as layer 4 (knowledge base passages). Layers 1-3 are always from local ref files (scoring, pharmacotherapy, de-escalation) to match 5-layer PDF structure."""
     patient_info = request_data.get("patientInfo", {})
     if top_two_results and len(top_two_results) >= 2:
         top_result, second_result = top_two_results[0], top_two_results[1]
@@ -333,10 +365,10 @@ def build_claude_prompt(request_data, results, drug_classes, patient, alternativ
     else:
         top_result = results[0] if results else {}
         second_result = results[1] if len(results) > 1 else {}
-    top_class = top_result.get("class", "N/A")
-    second_class = second_result.get("class", "N/A") if second_result else "N/A"
+    top_class = top_result.get("class") or ""
+    second_class = (second_result.get("class") or "") if second_result else ""
     top_drug_data = drug_classes.get(top_class, {})
-    second_drug_data = drug_classes.get(second_class, {}) if second_class != "N/A" else {}
+    second_drug_data = drug_classes.get(second_class, {}) if second_class else {}
     denied_rules = top_drug_data.get("deny_if", [])
     boost_rules = top_drug_data.get("clinical_boost", [])
     caution_rules = top_drug_data.get("caution_if", [])
@@ -353,21 +385,25 @@ def build_claude_prompt(request_data, results, drug_classes, patient, alternativ
     allergy_parts = [_format_allergy_for_display(a) for a in allergies_list if _format_allergy_for_display(a)]
     allergies_str = "; ".join(allergy_parts) if allergy_parts else "None"
     granular_allergy_note = _granular_allergy_clarification(allergies_list)
-    system_message = """You are a board-certified endocrinologist and clinical pharmacologist specializing in Type 2 diabetes management. You explain pre-computed medication recommendations to fellow clinicians using evidence-based reasoning grounded in the provided reference documents.
-
-This output is displayed directly to prescribing clinicians in a clinical decision support tool. Accuracy is critical — unsupported claims could affect patient care. Cite ONLY evidence present in the provided reference documents. If the references do not support a claim, do not make it."""
+    # Load static refs (Layers 1-3) for system block so Bedrock can cache them. KB retrieval (Layer 4) is per-request and stays in user message.
     calc_ref = _load_reference_file("RECOMMENDATION_CALCULATION_REFERENCE.md")
     pharm_ref = _load_reference_file("Type 2 Diabetes Pharmacotherapy Reference.docx.md")
     deesc_ref = _load_reference_file("Diabetes Med De-escalation handout.docx.md")
-    # Reference documents are included in the user prompt with XML tags for clear boundaries
-    ref_blocks = []
+    static_ref_blocks = []
     if calc_ref:
-        ref_blocks.append(f"<reference name=\"calculation\">\n{calc_ref}\n</reference>")
+        static_ref_blocks.append(f"<reference name=\"calculation\">\n{calc_ref}\n</reference>")
     if pharm_ref:
-        ref_blocks.append(f"<reference name=\"pharmacotherapy\">\n{pharm_ref}\n</reference>")
+        static_ref_blocks.append(f"<reference name=\"pharmacotherapy\">\n{pharm_ref}\n</reference>")
     if deesc_ref:
-        ref_blocks.append(f"<reference name=\"de-escalation\">\n{deesc_ref}\n</reference>")
-    references_section = "\n\n".join(ref_blocks) if ref_blocks else ""
+        static_ref_blocks.append(f"<reference name=\"de-escalation\">\n{deesc_ref}\n</reference>")
+    static_refs_section = "\n\n".join(static_ref_blocks) if static_ref_blocks else ""
+    system_message = """You are a board-certified endocrinologist and clinical pharmacologist specializing in Type 2 diabetes management. You explain pre-computed medication recommendations to fellow clinicians using evidence-based reasoning grounded in the provided reference documents.
+
+This output is displayed directly to prescribing clinicians in a clinical decision support tool. Accuracy is critical — unsupported claims could affect patient care. Cite ONLY evidence present in the provided reference documents. If the references do not support a claim, do not make it."""
+    if static_refs_section:
+        system_message = system_message + "\n\n## REFERENCE DOCUMENTS (Layers 1-3)\n\n" + static_refs_section
+    # Per-request content: KB retrieval (Layer 4) only; patient data and task go in user message
+    kb_section_for_user = (kb_references_section.strip() if kb_references_section and len(kb_references_section.strip()) > 0 else "")
     cgm_lines = []
     if norm_glucose.get("time_in_range") is not None:
         cgm_lines.append(f"- CGM Time in Range: {norm_glucose['time_in_range']}%")
@@ -382,22 +418,22 @@ This output is displayed directly to prescribing clinicians in a clinical decisi
     caution_str = ", ".join(str(c.get("rule", c)) for c in caution_rules) if caution_rules else "None"
     # For de-escalation, use medication/dose for display; otherwise class/drug
     if is_deescalation:
-        top_class = top_result.get("medication", top_result.get("class", "N/A"))
+        top_class = top_result.get("medication") or top_result.get("class") or ""
         top_drug_id = top_result.get("dose", "")
-        second_class = second_result.get("medication", second_result.get("class", "N/A")) if second_result else "N/A"
+        second_class = (second_result.get("medication") or second_result.get("class") or "") if second_result else ""
         second_drug_id = second_result.get("dose", "") if second_result else ""
         top_drug_data = {}
         second_drug_data = {}
     else:
-        top_class = top_result.get("class", "N/A")
-        top_drug_id = top_result.get("drug", top_result.get("class"))
-        second_class = second_result.get("class", "N/A") if second_result else "N/A"
-        second_drug_id = second_result.get("drug", second_result.get("class")) if second_result else None
+        top_class = top_result.get("class") or ""
+        top_drug_id = top_result.get("drug") or top_result.get("class")
+        second_class = (second_result.get("class") or "") if second_result else ""
+        second_drug_id = (second_result.get("drug") or second_result.get("class")) if second_result else None
         top_drug_data = drug_classes.get(top_class, {})
-        second_drug_data = drug_classes.get(second_class, {}) if second_class != "N/A" else {}
+        second_drug_data = drug_classes.get(second_class, {}) if second_class else {}
     lowest_cost_drug_id = lowest_cost_result.get("drug", lowest_cost_result.get("class")) if lowest_cost_result else None
     lowest_cost_is_duplicate = lowest_cost_drug_id and (lowest_cost_drug_id == top_result.get("drug") or lowest_cost_drug_id == (second_result.get("drug") if second_result else None))
-    lowest_cost_class = lowest_cost_result.get("class", "N/A") if lowest_cost_result else "N/A"
+    lowest_cost_class = (lowest_cost_result.get("class") or "") if lowest_cost_result else ""
     lowest_cost_drug_data = drug_classes.get(lowest_cost_result.get("class"), {}) if lowest_cost_result and lowest_cost_result.get("class") else {}
 
     # Build current medications string with doses
@@ -415,7 +451,7 @@ This output is displayed directly to prescribing clinicians in a clinical decisi
         rec_parts = [
             f"#1 RECOMMENDATION: {top_class}\n- Suggestion: {top_drug_id}"
         ]
-        if second_class != "N/A":
+        if second_class:
             rec_parts.append(f"#2 RECOMMENDATION: {second_class}\n- Suggestion: {second_drug_id}")
         if lowest_cost_result and not lowest_cost_is_duplicate:
             rec_parts.append(f"#3 OPTION: {lowest_cost_result.get('medication', lowest_cost_class)} - {lowest_cost_result.get('dose', '')}")
@@ -425,36 +461,34 @@ This output is displayed directly to prescribing clinicians in a clinical decisi
 #1 BEST CLINICAL FIT: {top_class} (Drug: {top_drug_id})
 - Clinical Fit: {top_result.get('clinical_fit', 0):.2f} (scale 0-1)
 - Coverage: {int(top_result.get('coverage', 0) * 100)}%
-- Cost Tier: {top_drug_data.get('tier', 'N/A')} ({top_drug_data.get('cost', 'N/A')} cost)
+- Cost Tier: {_cost_tier_display(top_drug_data)}
 - Clinical Boosts: {', '.join(applied_boosts) if applied_boosts else 'None'}
 - Cautions: {caution_str}
 
 {f'''#2 BEST CLINICAL FIT: {second_class} (Drug: {second_drug_id})
 - Clinical Fit: {(second_result.get('clinical_fit_rank') or second_result.get('clinical_fit', 0)):.2f}
 - Coverage: {int(second_result.get('coverage', 0) * 100)}%
-- Cost Tier: {second_drug_data.get('tier', 'N/A')} ({second_drug_data.get('cost', 'N/A')} cost)
-''' if second_class != 'N/A' else ''}
+- Cost Tier: {_cost_tier_display(second_drug_data)}
+''' if second_class else ''}
 {f'''LOWEST COST OPTION: {lowest_cost_class} (Drug: {lowest_cost_drug_id})
 - Clinical Fit: {lowest_cost_result.get('clinical_fit', 0):.2f}
 - Coverage: {int(lowest_cost_result.get('coverage', 0) * 100)}%
-- Cost Tier: {lowest_cost_drug_data.get('tier', 'N/A')} ({lowest_cost_drug_data.get('cost', 'N/A')} cost)
+- Cost Tier: {_cost_tier_display(lowest_cost_drug_data)}
 - NOTE: This is the same drug as #1 or #2, so DO NOT include best_cost_explanation.
 ''' if lowest_cost_result and lowest_cost_is_duplicate else (f'''LOWEST COST OPTION: {lowest_cost_class} (Drug: {lowest_cost_drug_id})
 - Clinical Fit: {lowest_cost_result.get('clinical_fit', 0):.2f}
 - Coverage: {int(lowest_cost_result.get('coverage', 0) * 100)}%
-- Cost Tier: {lowest_cost_drug_data.get('tier', 'N/A')} ({lowest_cost_drug_data.get('cost', 'N/A')} cost)
+- Cost Tier: {_cost_tier_display(lowest_cost_drug_data)}
 ''' if lowest_cost_result and not lowest_cost_is_duplicate else '')}"""
 
-    user_prompt = f"""{references_section}
-
-<patient_data>
+    user_prompt = f"""{kb_section_for_user + chr(10) + chr(10) if kb_section_for_user else ""}<patient_data>
 PATIENT PROFILE:
-- Age: {patient_info.get('age', 'N/A')} years
-- Current A1C: {patient_info.get('lastA1c', 'N/A')}%
-- A1C Goal: {patient_info.get('a1cGoal', 'N/A')}
-- eGFR: {patient_info.get('eGFR', 'N/A')} mL/min/1.73m²
-- Insurance: {patient_info.get('insurancePlan', 'N/A')}
-- Monitoring: {patient_info.get('monitoringMethod', 'N/A')}
+- Age: {patient_info.get('age') or ''} years
+- Current A1C: {patient_info.get('lastA1c') or ''}%
+- A1C Goal: {patient_info.get('a1cGoal') or ''}
+- eGFR: {patient_info.get('eGFR') or ''} mL/min/1.73m²
+- Insurance: {_insurance_display(patient_info)}
+- Monitoring: {patient_info.get('monitoringMethod') or ''}
 - Current Medications: {current_meds_str}
 - Comorbidities: {', '.join(request_data.get('comorbidities', [])) or 'None'}
 - Allergies: {allergies_str}
@@ -473,9 +507,9 @@ OTHER OPTIONS NOT IN TOP 3: {alt_drugs_str}
 {granular_allergy_note}
 </patient_data>"""
     if is_deescalation:
-        top_rec = top_result.get("medication", top_result.get("class", "N/A"))
+        top_rec = top_result.get("medication") or top_result.get("class") or ""
         top_dose = top_result.get("dose", "")
-        second_rec = second_result.get("medication", second_result.get("class", "N/A")) if second_result else "N/A"
+        second_rec = (second_result.get("medication") or second_result.get("class") or "") if second_result else ""
         second_dose = second_result.get("dose", "") if second_result else ""
         deesc_context = "A1C is above goal with documented hypoglycemia. Reduce sulfonylurea first; consider Metformin increase or add-on therapy after reduction." if a1c_above_goal else "A1C is at goal with hypoglycemia detected. The recommendations are REDUCE and MAINTAIN actions (not add-on therapy)."
         user_prompt += f"""
@@ -508,8 +542,10 @@ REQUIRED FIELDS:
    - Recheck fasting glucose in 1-2 weeks.
    - If A1C rises after de-escalation, consider re-escalation.
    {f'- IMPORTANT: A1C is above goal. Include: reduce sulfonylurea per handout, then consider Metformin increase or add-on (SGLT2/GLP1/DPP4) to address A1C.' if a1c_above_goal else ''}
+   - Optionally include up to one brief "clinical pearl" when the patient profile or Additional Context clearly suggests a specific follow-up (e.g. on GLP-1 at max dose with stated desire for more weight loss → consider mentioning switch to dual GLP-1/GIP for higher weight-loss potential; other situation-specific pearls as relevant). Do not change the recommended options; only add a short, relevant follow-up when it clearly applies.
+   - FUTURE CONSIDERATIONS RULES: (1) Exclude any statements about sulfonylurea (SUR-1) or DPP-4 inhibitors UNLESS the patient is actively on one of these therapies in Current Medications OR one is recommended as a new start in the top recommendations. (2) "Monitor for hypoglycemia" or "Monitor fasting glucose closely" with basal/bolus insulin or CGM are appropriate to leave in; they do not require special clinician review but keep them when relevant.
 
-6. "updated_assessment" (string): Return an updated version of the CLINICAL ASSESSMENT that incorporates relevant insights from the Additional Context and recommendation results. Preserve all core facts from the original. You may add 1-2 observations based on the patient profile or Additional Context — but do NOT introduce new diagnoses, risk assessments, or clinical claims not present in the patient data. Keep it concise (2-4 sentences total). If no changes are needed, return the original verbatim.
+6. "updated_assessment" (string): Return an updated version of the CLINICAL ASSESSMENT that incorporates relevant insights from the Additional Context and recommendation results. Preserve all core facts from the original. You may add 1-2 observations based on the patient profile or Additional Context — but do NOT introduce new diagnoses, risk assessments, or clinical claims not present in the patient data. Keep it concise (2-4 sentences total). If no changes are needed, return the original verbatim. Do NOT add " ***see future considerations***" to the assessment; the application adds it when Additional Context is provided.
 
 RESPONSE FORMAT — return ONLY this JSON (no markdown, no code blocks, no extra text):
 {{
@@ -554,9 +590,11 @@ REQUIRED FIELDS:
 5. "future_considerations" (array of strings): Recommendations based on <reference name="de-escalation">.
    - If starting a high-potency drug (GLP-1, Basal Insulin, Bolus Insulin), include relevant de-escalation guidance.
    - If patient has lows detected, include dose reduction recommendations.
+   - Optionally include up to one brief "clinical pearl" when the patient profile or Additional Context clearly suggests a specific follow-up (e.g. on GLP-1 at max dose with stated desire for more weight loss → consider mentioning switch to dual GLP-1/GIP for higher weight-loss potential; other situation-specific pearls as relevant). Do not change the recommended options; only add a short, relevant follow-up when it clearly applies.
    - If no de-escalation applies, return empty array [].
+   - FUTURE CONSIDERATIONS RULES: (1) Exclude any statements about sulfonylurea (SUR-1) or DPP-4 inhibitors UNLESS the patient is actively on one of these therapies in Current Medications OR one is recommended as a new start in the top recommendations. (2) "Monitor for hypoglycemia" or "Monitor fasting glucose closely" with basal/bolus insulin or CGM are appropriate to leave in; they do not require special clinician review but keep them when relevant.
 
-6. "updated_assessment" (string): Return an updated version of the CLINICAL ASSESSMENT that incorporates relevant insights from the Additional Context and recommendation results. Preserve all core facts from the original. You may add 1-2 observations based on the patient profile or Additional Context — but do NOT introduce new diagnoses, risk assessments, or clinical claims not present in the patient data. Keep it concise (2-4 sentences total). If no changes are needed, return the original verbatim.
+6. "updated_assessment" (string): Return an updated version of the CLINICAL ASSESSMENT that incorporates relevant insights from the Additional Context and recommendation results. Preserve all core facts from the original. You may add 1-2 observations based on the patient profile or Additional Context — but do NOT introduce new diagnoses, risk assessments, or clinical claims not present in the patient data. Keep it concise (2-4 sentences total). If no changes are needed, return the original verbatim. Do NOT add " ***see future considerations***" to the assessment; the application adds it when Additional Context is provided.
 
 RESPONSE FORMAT — return ONLY this JSON (no markdown, no code blocks, no extra text):
 {{
@@ -648,6 +686,219 @@ def _parse_claude_rationale(parsed):
             alternatives.append(val.strip())
         return {"rationale": rationale, "alternatives": alternatives, "future_considerations": [], "updated_assessment": ""}
     return None
+
+
+# Minimum relevance score to keep a KB chunk (PDF: "Filter low-relevance chunks").
+KB_RETRIEVAL_SCORE_THRESHOLD = 0.3
+
+
+def retrieve_from_bedrock_kb(knowledge_base_id, query, region=None, number_of_results=5, score_threshold=None):
+    """Retrieve relevant chunks from a Bedrock Knowledge Base. Returns (content_string, chunk_count).
+    content_string is XML-wrapped for the prompt; only chunks with score > score_threshold (default 0.3) are kept."""
+    threshold = score_threshold if score_threshold is not None else KB_RETRIEVAL_SCORE_THRESHOLD
+    try:
+        import boto3
+        kwargs = {"service_name": "bedrock-agent-runtime"}
+        if region:
+            kwargs["region_name"] = region
+        client = boto3.client(**kwargs)
+        request_params = {
+            "knowledgeBaseId": knowledge_base_id,
+            "retrievalQuery": {"text": query[:8000]},
+        }
+        if number_of_results and number_of_results > 0:
+            request_params["retrievalConfiguration"] = {
+                "vectorSearchConfiguration": {"numberOfResults": min(number_of_results, 25)}
+            }
+        response = client.retrieve(**request_params)
+        results = response.get("retrievalResults") or []
+        chunks = []
+        for r in results:
+            score = r.get("score", 1.0)
+            if score is not None and float(score) <= threshold:
+                continue
+            content = r.get("content") or {}
+            if content.get("type") == "TEXT" and content.get("text"):
+                chunks.append(content["text"].strip())
+        if not chunks:
+            return "", 0
+        combined = "\n\n".join(chunks)
+        content_str = f'<reference name="retrieved">\n{combined}\n</reference>'
+        return content_str, len(chunks)
+    except Exception as e:
+        import sys
+        print(f"Bedrock KB retrieve failed: {e}", file=sys.stderr)
+        return "", 0
+
+
+def call_bedrock_rag(
+    knowledge_base_id,
+    model_id,
+    input_text,
+    prompt_template,
+    temperature=0.2,
+    region=None,
+    number_of_results=10,
+    max_retries=3,
+    use_cache=False,
+):
+    """Single-call RAG: Bedrock RetrieveAndGenerate (KB retrieval + generation). Uses prompt_template
+    with $search_results$ and $query$; input_text is the user request ($query$). Returns same dict
+    shape as call_claude_api: rationale, alternatives, future_considerations, updated_assessment."""
+    try:
+        import boto3
+        kwargs = {"service_name": "bedrock-agent-runtime"}
+        if region:
+            kwargs["region_name"] = region
+        client = boto3.client(**kwargs)
+    except ImportError:
+        raise Exception("boto3 is required for Bedrock RAG")
+    # modelArn: some APIs accept short id; use full ARN if needed (region from client)
+    model_arn = model_id if model_id.startswith("arn:") else f"arn:aws:bedrock:{region or 'us-east-1'}::foundation-model/{model_id}"
+    retrieval_config = {}
+    if number_of_results and number_of_results > 0:
+        retrieval_config["vectorSearchConfiguration"] = {"numberOfResults": min(number_of_results, 25)}
+    gen_config = {
+        "inferenceConfig": {"textInferenceConfig": {"maxTokens": 1500, "temperature": temperature}},
+        "promptTemplate": {"textPromptTemplate": prompt_template},
+    }
+    # Prompt caching on RAG: if supported by the model, set via additionalModelRequestFields (model-specific)
+    if use_cache:
+        gen_config.setdefault("additionalModelRequestFields", {})["cache_control"] = {"ttl": "1h"}
+    kb_config = {
+        "knowledgeBaseId": knowledge_base_id,
+        "modelArn": model_arn,
+        "generationConfiguration": gen_config,
+    }
+    if retrieval_config:
+        kb_config["retrievalConfiguration"] = retrieval_config
+    for attempt in range(max_retries):
+        try:
+            response = client.retrieve_and_generate(
+                input={"text": input_text[:20000]},
+                retrieveAndGenerateConfiguration={
+                    "type": "KNOWLEDGE_BASE",
+                    "knowledgeBaseConfiguration": kb_config,
+                },
+            )
+            output = response.get("output") or {}
+            # Response: output.sessionId, output.generation (generationContent or content list), output.citations
+            generation = output.get("generation") or {}
+            content_list = generation.get("generationContent") or generation.get("content") or output.get("generationContent") or []
+            if isinstance(generation.get("text"), str):
+                text_content = generation["text"].strip()
+            else:
+                text_parts = []
+                for block in (content_list if isinstance(content_list, list) else [content_list]):
+                    if isinstance(block, dict) and block.get("text"):
+                        text_parts.append(block["text"])
+                text_content = "".join(text_parts).strip()
+            if not text_content:
+                raise ValueError("No text in RAG response")
+            try:
+                parsed = json.loads(text_content)
+                result = _parse_claude_rationale(parsed)
+                if result:
+                    return result
+            except json.JSONDecodeError:
+                pass
+            for pattern in [r'\{[\s\S]*"best_choice_explanation"[\s\S]*\}', r'\{[\s\S]*"rationale_best"[\s\S]*\}', r'\{[\s\S]*"sentences"[\s\S]*\}']:
+                json_match = re.search(pattern, text_content)
+                if json_match:
+                    try:
+                        parsed = json.loads(json_match.group(0))
+                        result = _parse_claude_rationale(parsed)
+                        if result:
+                            return result
+                    except Exception:
+                        continue
+            sentences = re.split(r'[.!?]+\s+', text_content)
+            sentences = [s.strip() for s in sentences if s.strip() and len(s.strip()) > 20 and not s.startswith("```")]
+            return {"rationale": sentences[:9] if sentences else [], "alternatives": [], "future_considerations": [], "updated_assessment": ""}
+        except Exception as e:
+            if attempt < max_retries - 1:
+                time.sleep((2 ** attempt) + (attempt * 0.5))
+                continue
+            raise
+    raise Exception(f"Bedrock RAG failed after {max_retries} attempts")
+
+
+def call_bedrock_claude(prompt, model_id, temperature=0.3, system_message=None, region=None, max_retries=3, use_cache=False, max_tokens=2048):
+    """Call Claude on Bedrock via Converse API. Returns same dict shape as call_claude_api plus
+    input_tokens, output_tokens for logging. Bedrock Converse: use only temperature (not topP) for this model."""
+    try:
+        import boto3
+        kwargs = {"service_name": "bedrock-runtime"}
+        if region:
+            kwargs["region_name"] = region
+        client = boto3.client(**kwargs)
+    except ImportError:
+        raise Exception("boto3 is required for Bedrock")
+    # Converse on-demand requires an inference profile, not the foundation model ID.
+    model_id_to_use = model_id.strip()
+    if model_id_to_use in ("anthropic.claude-sonnet-4-6", "anthropic.claude-sonnet-4-6-v1"):
+        model_id_to_use = "global.anthropic.claude-sonnet-4-6"
+    messages = [{"role": "user", "content": [{"text": prompt}]}]
+    if system_message:
+        system_blocks = [{"text": system_message}]
+        if use_cache:
+            system_blocks.append({"cachePoint": {"type": "default"}})
+    else:
+        system_blocks = []
+    inference_config = {"maxTokens": max_tokens, "temperature": temperature}
+    for attempt in range(max_retries):
+        try:
+            request_kw = {
+                "modelId": model_id_to_use,
+                "messages": messages,
+                "inferenceConfig": inference_config,
+            }
+            if system_blocks:
+                request_kw["system"] = system_blocks
+            response = client.converse(**request_kw)
+            usage = response.get("usage") or {}
+            input_tokens = usage.get("inputTokens", 0)
+            output_tokens = usage.get("outputTokens", 0)
+            output = response.get("output") or {}
+            msg = output.get("message") or {}
+            content_list = msg.get("content") or []
+            text_parts = []
+            for block in content_list:
+                if isinstance(block, dict) and block.get("text"):
+                    text_parts.append(block["text"])
+            text_content = "".join(text_parts).strip()
+            if not text_content:
+                raise ValueError("No text in Bedrock response")
+            try:
+                parsed = json.loads(text_content)
+                result = _parse_claude_rationale(parsed)
+                if result:
+                    result["input_tokens"] = input_tokens
+                    result["output_tokens"] = output_tokens
+                    return result
+            except json.JSONDecodeError:
+                pass
+            for pattern in [r'\{[\s\S]*"best_choice_explanation"[\s\S]*\}', r'\{[\s\S]*"rationale_best"[\s\S]*\}', r'\{[\s\S]*"sentences"[\s\S]*\}']:
+                json_match = re.search(pattern, text_content)
+                if json_match:
+                    try:
+                        parsed = json.loads(json_match.group(0))
+                        result = _parse_claude_rationale(parsed)
+                        if result:
+                            result["input_tokens"] = input_tokens
+                            result["output_tokens"] = output_tokens
+                            return result
+                    except Exception:
+                        continue
+            sentences = re.split(r'[.!?]+\s+', text_content)
+            sentences = [s.strip() for s in sentences if s.strip() and len(s.strip()) > 20 and not s.startswith("```")]
+            return {"rationale": sentences[:9] if sentences else [], "alternatives": [], "future_considerations": [], "updated_assessment": "", "input_tokens": input_tokens, "output_tokens": output_tokens}
+        except Exception as e:
+            if attempt < max_retries - 1:
+                time.sleep((2 ** attempt) + (attempt * 0.5))
+                continue
+            raise
+    raise Exception(f"Bedrock Converse failed after {max_retries} attempts")
 
 
 def call_claude_api(prompt, api_key, model="claude-sonnet-4-5-20250929", temperature=0.2, system_message=None, max_retries=3):

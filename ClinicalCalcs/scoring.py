@@ -15,8 +15,6 @@ from glucose import (
     estimate_post_prandial_from_a1c,
     get_target_fasting,
     get_target_post_prandial,
-    FASTING_LOWERING_POTENTIAL,
-    POST_PRANDIAL_LOWERING_POTENTIAL,
 )
 
 
@@ -40,8 +38,8 @@ def _rule_context(patient, normalized_glucose=None, goal3_data=None):
         post_pp_avg = normalized_glucose.get("post_pp_avg")
         if post_pp_avg is None and patient.get("a1c") is not None:
             post_pp_avg = estimate_post_prandial_from_a1c(patient.get("a1c"), goal3_data)
-        ctx["fasting_above_goal"] = (float(fasting_avg) - target_fasting) if fasting_avg is not None else None
-        ctx["post_prandial_above_goal"] = (float(post_pp_avg) - target_post_prandial) if post_pp_avg is not None else None
+        ctx["fasting_above_goal"] = (float(fasting_avg) - target_fasting) if (fasting_avg is not None and target_fasting is not None) else None
+        ctx["post_prandial_above_goal"] = (float(post_pp_avg) - target_post_prandial) if (post_pp_avg is not None and target_post_prandial is not None) else None
     # Add fasting_avg and lows_detected for Basal Insulin guardrail (fasting at goal with lows)
     if normalized_glucose is not None:
         fasting_avg = normalized_glucose.get("fasting_avg")
@@ -202,6 +200,12 @@ def calculate_clinical(drug_id, drug_data, patient, rules_json=None, goal1_data=
     # Exclude entire class if patient is on any drug in this class at max dose (do not add another in same class)
     if _patient_on_class_at_max_dose(patient, drug_class, drugs_config):
         return 0.0
+    # Deny DPP-4 when patient is on GLP-1 therapy (mechanistic duplication; do not combine)
+    if drug_class == "DPP4" and drugs_config:
+        for cid in patient.get("current_drug_ids") or set():
+            cdata = drugs_config.get(cid)
+            if isinstance(cdata, dict) and cdata.get("class") == "GLP1":
+                return 0.0
     score = drug_data.get("clinical_base", 0.5)
     context = _rule_context(patient, normalized_glucose, goal3_data)
 
@@ -228,9 +232,15 @@ def calculate_clinical(drug_id, drug_data, patient, rules_json=None, goal1_data=
     elif patient["goal"] <= 7.5:
         score += 0.03
     if include_current_therapy_boost:
-        current_therapy_boost = (goal1_data or {}).get("current_therapy_boost", 0.20)
-        if drug_id in patient.get("current_drug_ids", set()):
+        current_therapy_boost = (goal1_data or {}).get("current_therapy_boost")
+        if current_therapy_boost is not None and drug_id in patient.get("current_drug_ids", set()):
             score += current_therapy_boost
+    # When A1C is at or below goal, prefer "Continue" over dose escalation (clinician feedback)
+    if drug_class == "No Change":
+        a1c = patient.get("a1c")
+        goal = patient.get("goal")
+        if a1c is not None and goal is not None and a1c > 0 and a1c <= goal:
+            score = 1.0
     score = min(score, 1.0)  # allow 1.0 for No Change; other drugs capped at 0.90 below
     if drug_class != "No Change":
         score = min(score, 0.90)
@@ -244,10 +254,23 @@ def insurance_adjustment(patient):
 
 
 def cost_tier_penalty(drug_data):
-    """Cost and tier penalties."""
-    cost_penalty = {"very_high": -0.10, "high": -0.07, "medium": -0.03, "low": 0.05}.get(drug_data.get("cost", "medium"), 0.0)
-    tier_penalty = {4: -0.12, 3: -0.08, 2: -0.03, 1: 0.02}.get(drug_data.get("tier", 2), 0.0)
-    return cost_penalty + tier_penalty
+    """Cost and tier penalties. When price_per_month is present, adds a small bonus for lower price. No fallback for cost/tier."""
+    cost = drug_data.get("cost")
+    cost_penalty = {"very_high": -0.10, "high": -0.07, "medium": -0.03, "low": 0.05}.get(cost, 0.0) if cost is not None else 0.0
+    tier = drug_data.get("tier")
+    tier_penalty = {4: -0.12, 3: -0.08, 2: -0.03, 1: 0.02}.get(tier, 0.0) if tier is not None else 0.0
+    price_bonus = 0.0
+    try:
+        p = drug_data.get("price_per_month")
+        if p is not None:
+            p = float(p)
+            if p < 50:
+                price_bonus = 0.02
+            elif p < 100:
+                price_bonus = 0.01
+    except (TypeError, ValueError):
+        pass
+    return cost_penalty + tier_penalty + price_bonus
 
 
 def pa_penalty(drug_data):
@@ -256,10 +279,11 @@ def pa_penalty(drug_data):
 
 
 def va_pdf_boost(drug_data):
-    """VA PDF boost by cost tier."""
+    """VA PDF boost by cost tier. No fallback for cost."""
     if not drug_data.get("va_pdf_exists", False):
         return 0.0
-    return {"low": 0.15, "medium": 0.20, "high": 0.25, "very_high": 0.30}.get(drug_data.get("cost", "medium"), 0.20)
+    cost = drug_data.get("cost")
+    return {"low": 0.15, "medium": 0.20, "high": 0.25, "very_high": 0.30}.get(cost, 0.0) if cost is not None else 0.0
 
 
 def cgm_boost(patient):
@@ -326,7 +350,7 @@ def get_all_drug_weight_details(config, patient, rules_json=None, normalized_glu
     """Detailed weight info per drug (denied, boosts, cautions, Goal 3). config = {classes, drugs}. All at drug level."""
     drugs = config.get("drugs", config.get("drug_classes", {}))
     all_details = []
-    current_therapy_boost = (goal1_data or {}).get("current_therapy_boost", 0.20)
+    current_therapy_boost = (goal1_data or {}).get("current_therapy_boost")
     for drug_id, drug_data in drugs.items():
         drug_class = drug_data.get("class", drug_id)
         clinical = calculate_clinical(drug_id, drug_data, patient, None, goal1_data, include_current_therapy_boost=True, normalized_glucose=normalized_glucose, goal3_data=goal3_data, drugs_config=drugs)
@@ -348,16 +372,14 @@ def get_all_drug_weight_details(config, patient, rules_json=None, normalized_glu
             target_post_prandial = get_target_post_prandial(goal, goal3_data)
             is_currently_on = drug_id in patient.get("current_drug_ids", set())
             by_drug = (goal3_data or {}).get("potency_by_drug") or {}
-            by_class = (goal3_data or {}).get("potency_by_class") or {}
-            pcls = by_drug.get(drug_id) or by_class.get(drug_class, {})
-            fp = pcls.get("fasting") if isinstance(pcls, dict) else FASTING_LOWERING_POTENTIAL.get(drug_class, 0)
-            pp = pcls.get("post_prandial") if isinstance(pcls, dict) else POST_PRANDIAL_LOWERING_POTENTIAL.get(drug_class, 0)
-            if fp is None:
-                fp = FASTING_LOWERING_POTENTIAL.get(drug_class, 0)
-            if pp is None:
-                pp = POST_PRANDIAL_LOWERING_POTENTIAL.get(drug_class, 0)
-            fasting_potential = fp * (0.5 if is_currently_on else 1.0)
-            post_pp_potential = pp * (0.5 if is_currently_on else 1.0)
+            pcls = by_drug.get(drug_id)
+            if isinstance(pcls, dict):
+                fp = pcls.get("fasting")
+                pp = pcls.get("post_prandial")
+            else:
+                fp = pp = None
+            fasting_potential = (fp or 0) * (0.5 if is_currently_on else 1.0)
+            post_pp_potential = (pp or 0) * (0.5 if is_currently_on else 1.0)
             goal3_info = {
                 "boost": goal3_boost,
                 "fasting_current": fasting_current,
@@ -407,7 +429,7 @@ def get_all_drug_weight_details(config, patient, rules_json=None, normalized_glu
                 desc = _rule_to_description(r)
                 add_val = boost.get("add", 0)
                 applied_boosts.append({"condition": f"{desc} (+{add_val:.2f})", "add": add_val})
-        if drug_id in patient.get("current_drug_ids", set()):
+        if current_therapy_boost is not None and drug_id in patient.get("current_drug_ids", set()):
             applied_boosts.append({"condition": f"Current therapy (+{current_therapy_boost:.2f})", "add": current_therapy_boost})
         drug_bonus = drug_data.get("drug_in_class_bonus", 0)
         if drug_bonus != 0:

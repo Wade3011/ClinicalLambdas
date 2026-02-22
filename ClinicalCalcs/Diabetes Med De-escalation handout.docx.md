@@ -1,105 +1,40 @@
-Diabetes De-escalation Concepts/Future Considerations:
+# Diabetes De-escalation (trimmed)
 
-**Documented Lows: Proceed with approaches below**
+*When documented lows: use tables below for dose reduction/stop. For full tables and wording, use Knowledge Base retrieval.*
 
-FASTING AVERAGE or WAKE UP AVERAGE or “DURING THE NIGHT”:
+## Priority order when patient is on therapy
 
-\-Therapy reductions or stoppages preference if patient actively on: (Order is established by priority with first drug class referenced in descending order)
+**FASTING / WAKE UP / NIGHT LOWS — reduce in this order:**
 
-Sulfonylurea: (1.1)
+**Sulfonylurea (table 1.1):** Cut total dose in half if at or above threshold; stop below threshold.
+- Glipizide: lower at ≥10 mg daily; stop <10 mg daily.
+- Glyburide: lower at ≥10 mg daily; stop <10 mg daily.
+- Glimepiride: lower at ≥4 mg daily; stop <4 mg daily.
 
-| Drug: | When to lower dose: | When to stop: |
-| :---- | :---- | :---- |
-| Glipizide:  | 10 mg daily or higher 🡪 Cut total dose in half | Less than 10 mg daily |
-| Glyburide: | 10 mg daily or higher 🡪 Cut total dose in half | Less than 10 mg daily |
-| Glimepiride: | 4 mg daily or higher 🡪 Cut total dose in half | Less than 4 mg daily |
+**Basal insulin (table 1.2):** ≥21 units → reduce by 20%. 10–20 units → cut in half. <10 units → stop.
 
-Basal Insulin: (1.2)
+**If neither above:** Reduce/stop in order: Pioglitazone (reduce 15 mg or stop at 15 mg) → Metformin (cut in half or stop at 500 mg) → GLP-1 (next lower dose) → Sitagliptin (stop) → Bolus (reduce 1 unit/meal) → Empagliflozin (stop unless CHF/CKD; then half).
 
-| Dose Lowering: |
-| :---- |
-| Dose 21 units or higher 🡪 Reduce total daily dose by 20% |
-| Dose 10-20 units 🡪 Cut dose in half |
-| Dose Less than 10 units 🡪 stop insulin therapy  |
+**POST-PRANDIAL / BEDTIME / DAY LOWS — reduce in this order:**
 
-\-If neither of above therapies are actively present: reduce doses and/or stop in following order: (Order is established by priority with first drug class referenced in descending order)
+**Bolus insulin (table 2.1):** ≥15 units → reduce 20%. 6–14 units → cut in half. ≤5 units → stop.
 
-1. Pioglitazone – reduce dose by 15 mg OR stop if dose at 15 mg  
-   2. Metformin – Cut Dose in half OR stop if dose at 500 mg  
-   3. GLP-1 – Go to next lower dose (e.g. Ozempic 1 mg weekly; decrease 0.5 mg weekly)  
-   4. Sitagliptin – Stop Therapy  
-   5. Bolus Insulin: Reduce dose by 1 unit per meal  
-   6. Empagliflozin – Stop therapy unless CHF or CKD co-morbidity; then cut dose in half
+**Pioglitazone (table 2.2):** Decrease by 15 mg; stop at 15 mg daily.
 
-POST-PRANDIAL AVERAGE or BEDTIME AVERAGE or “DURING THE DAY”:
+**Sulfonylurea (table 2.3):** Same as 1.1 (cut in half above threshold; stop below).
 
-\-Therapy reductions or stoppages preference if patient actively on: (Order is established by priority with first drug class referenced in descending order)
+**GLP-1 (table 2.4):** Step down to next lower dose; stop at lowest (e.g. Semaglutide 0.5 mg weekly, Dulaglutide 0.75 mg, Mounjaro 2.5 mg, Rybelsus 3 mg).
 
-a.Bolus Insulin: (2.1)
+**Basal (table 2.5):** Same as 1.2.
 
-| Dose Lowering: |
-| :---- |
-| Total Daily Dose 15 units or higher 🡪 Reduce total daily dose by 20% |
-| Total Daily Dose 6-14 unit or less units 🡪 Cut dose in half |
-| Total Daily Dose 5 units or less 🡪 Stop bolus insulin |
+**If none above:** Sitagliptin stop → Metformin half/stop → Empagliflozin stop unless CHF/CKD then half.
 
-b.Pioglitazone: (2.2)
+## Starting high-potency drugs — adjust other therapies
 
-| Drug: | How to lower dose: | When to stop: |
-| :---- | :---- | :---- |
-| Pioglitazone:  | Decrease dose by 15 mg daily | Current dose 15 mg daily |
+**Starting basal insulin:** Sulfonylurea → table 1.1. Pioglitazone → table 2.2. DPP-4 → consider stop (replaceable efficacy).
 
-c.Sulfonylurea: (2.3) 
+**Starting bolus insulin:** Sulfonylureas → stop. Pioglitazone → 2.2. DPP-4 → consider stop.
 
-| Drug: | When to lower dose: | When to stop: |
-| :---- | :---- | :---- |
-| Glipizide:  | 10 mg daily or higher 🡪 Cut total dose in half | Less than 10 mg daily |
-| Glyburide: | 10 mg daily or higher 🡪 Cut total dose in half | Less than 10 mg daily |
-| Glimepiride: | 4 mg daily or higher 🡪 Cut total dose in half | Less than 4 mg daily |
+**Starting GLP-1 or GLP-1/GIP:** DPP-4 → stop. Sulfonylureas → table 1.1. Pioglitazone → 2.2. Basal → table 1.2. Bolus → table 2.1.
 
-d.GLP-1: (2.4)
-
-| Drug: | How to lower dose: | When to stop: |
-| :---- | :---- | :---- |
-| Semaglutide | 1 mg or higher weekly dose 🡪 Cut dose in half | 0.5 mg weekly |
-| Dulaglutide | Stepdown approach: 4.5 mg 🡪 3 mg 🡪 1.5 mg 🡪 0.75 mg  | 0.75 mg weekly |
-| Mounjaro | Stepdown approach. 15 mg 🡪 12.5 mg 🡪 10 mg 🡪 7.5 mg 🡪 5 mg 🡪 2.5 mg  | 2.5 mg weekly |
-| Liraglutide | 1.8 mg weekly 🡪 decrease dose by 0.6 mg weekly | 0.6 mg weekly |
-| Rybelsus | Step down approach: 14 mg 🡪 7 mg 🡪 3 mg | 3 mg |
-
-Basal Insulin: (2.5)
-
-| Dose Lowering: |
-| :---- |
-| Dose 21 units or higher 🡪 Reduce total daily dose by 20% |
-| Dose 10-20 units 🡪 Cut dose in half |
-| Dose Less than 10 units 🡪 stop insulin therapy  |
-
-If none of the above therapies are actively present reduce doses and/or stop in following order: (Order is established by priority with first drug class referenced in descending order)
-
-7. Sitagliptin – Stop Therapy  
-   8. Metformin – Cut Dose in half OR stop if dose at 500 mg  
-   9. Empagliflozin – Stop therapy unless CHF or CKD co-morbidity; then cut dose in half
-
-**Starting High Potency Drugs – How to manage/recommend other therapies:**
-
-1. Basal Insulin:  
-   1. Sulfonylurea: Follow recommendation in table 1.1  
-   2. Pioglitazone: Follow recommendation in table 2.2  
-   3. DPP-IV: Consider stop due to replaceable efficacy  
-   4. No other drugs require proactive adjustments  
-        
-2. Bolus insulin:  
-   1. Sulfonylureas: Stop therapy  
-   2. Pioglitazone: Follow Recommendations 2.2  
-   3. DPP-IV: Consider stop due to replaceable efficacy  
-   4. No other drugs require proactive adjustments  
-        
-3. GLP-1 or GLP-1/GIP:  
-   1. DPP-IV: Stop therapy  
-   2. Sulfonylureas: Follow recommendations table 1.1  
-   3. Pioglitazone: Follow Recommendations 2.2  
-   4. Basal Insulin: Follow recommendations from table 1.2  
-   5. Bolus Insulin: Follow Recommendations from table 2.1  
-   6. No other drugs require proactive adjustments
-
+*Use Knowledge Base retrieval for exact dose thresholds and full table wording.*
