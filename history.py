@@ -3,7 +3,7 @@ Get History Lambda: fetches recommendation history from DynamoDB for a user.
 Table: T2D (or TABLE_NAME env var).
 Partition key: userID (String), Sort key: timestamp (String, ISO 8601).
 
-Returns the 5 most recent logs:
+Returns the 15 most recent logs:
   { history: [ { id, timestamp, request, response }, ... ] }
 """
 import json
@@ -108,16 +108,24 @@ def _format_history_item(item):
 
 
 def _get_user_id(event):
-    """Get userID: prefer Cognito authorizer claims, else body/event."""
+    """Get userID: prefer Cognito authorizer claims (REST or HTTP API), else body/event.
+    GET requests have no body; userID must come from authorizer.claims.sub or authorizer.jwt.claims.sub."""
     try:
-        claims = (event.get("requestContext") or {}).get("authorizer") or {}
-        if isinstance(claims, dict) and "claims" in claims:
-            sub = (claims["claims"] or {}).get("sub")
+        authorizer = (event.get("requestContext") or {}).get("authorizer") or {}
+        if not isinstance(authorizer, dict):
+            authorizer = {}
+        # REST API: authorizer.claims.sub | HTTP API: authorizer.jwt.claims.sub | some setups: authorizer.sub
+        sub = authorizer.get("sub")
+        if sub:
+            return str(sub)
+        claims = authorizer.get("claims") or authorizer.get("jwt", {}).get("claims") or {}
+        if isinstance(claims, dict):
+            sub = claims.get("sub")
             if sub:
                 return str(sub)
     except Exception:
         pass
-    body = event.get("body", event)
+    body = event.get("body")  # GET has no body; avoid using event as body fallback
     if isinstance(body, str):
         try:
             body = json.loads(body) if body else {}
@@ -132,14 +140,21 @@ def _get_user_id(event):
 
 def handler(event, context):
     """
-    Returns the 5 most recent history items.
+    Returns the 15 most recent history items.
     Payload: { history: [ { id, timestamp, request, response }, ... ] }
+    Always returns a valid API Gateway proxy response so the client gets a response.
     """
     try:
+        http_method = (event.get("requestContext") or {}).get("http", {}).get("method") or event.get("httpMethod") or "GET"
+        has_authorizer = bool((event.get("requestContext") or {}).get("authorizer"))
+        print(f"[get_history] method={http_method} has_authorizer={has_authorizer}", flush=True)
+
         user_id = _get_user_id(event)
-        print(f"[get_history] userID={user_id}")
+        print(f"[get_history] userID={user_id}", flush=True)
         if not user_id:
-            return _response(400, {"error": "Missing userID or userId"})
+            out = _response(400, {"error": "Missing userID or userId"})
+            print("[get_history] returning 400 (no userID)", flush=True)
+            return out
 
         table_name = os.environ.get("TABLE_NAME", "T2D")
         if not boto3:
@@ -152,27 +167,44 @@ def handler(event, context):
             KeyConditionExpression="userID = :uid",
             ExpressionAttributeValues={":uid": str(user_id)},
             ScanIndexForward=False,
-            Limit=5,
+            Limit=15,
         )
 
         raw_items = result.get("Items", [])
         history = [_format_history_item(it) for it in raw_items]
-        print(f"[get_history] returned {len(history)} items for userID={user_id}")
-
-        return _response(200, {"history": history})
+        print(f"[get_history] returning {len(history)} items for userID={user_id}", flush=True)
+        out = _response(200, {"history": history})
+        print("[get_history] response built, returning 200", flush=True)
+        return out
     except json.JSONDecodeError as e:
         return _response(400, {"error": f"Invalid JSON: {e!s}"})
     except Exception as e:
-        print(f"[get_history] error: {e}")
+        print(f"[get_history] error: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
         return _response(500, {"error": str(e)})
+    finally:
+        # Ensure any buffered stdout is sent before Lambda freezes (helps with "no return" debugging)
+        try:
+            import sys
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
 
 
 def _response(status_code, body):
+    """Return API Gateway Lambda proxy response. Ensures body is always a JSON string."""
+    try:
+        body_str = json.dumps(body, default=str)
+    except Exception as e:
+        body_str = json.dumps({"error": "Response serialization failed", "detail": str(e)})
+        status_code = 500
     return {
         "statusCode": status_code,
         "headers": {
             "Content-Type": "application/json",
             "Access-Control-Allow-Origin": "*",
         },
-        "body": json.dumps(body, default=str),
+        "body": body_str,
     }
