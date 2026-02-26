@@ -1,0 +1,81 @@
+{
+  "description": "Cost tier and optional price_per_month (USD/month) by drug class (by_class) and per drug (by_drug). by_drug overrides class. cost: low|medium|high|very_high, tier: 1-4. price_per_month is optional; when present used for lowest-cost sort and display.",
+  "by_class": {
+    "Metformin": {
+      "cost": "low",
+      "tier": 1,
+      "price_per_month": 10
+    },
+    "TZD": {
+      "cost": "low",
+      "tier": 1,
+      "price_per_month": 15
+    },
+    "Sulfonylurea": {
+      "cost": "low",
+      "tier": 1,
+      "price_per_month": 12
+    },
+    "DPP4": {
+      "cost": "medium",
+      "tier": 2,
+      "price_per_month": 45
+    },
+    "SGLT2": {
+      "cost": "medium",
+      "tier": 2,
+      "price_per_month": 55
+    },
+    "GLP1": {
+      "cost": "high",
+      "tier": 3,
+      "price_per_month": 200
+    },
+    "Basal Insulin": {
+      "cost": "medium",
+      "tier": 2,
+      "price_per_month": 80
+    },
+    "Bolus Insulin": {
+      "cost": "medium",
+      "tier": 2,
+      "price_per_month": 75
+    },
+    "No Change": {
+      "cost": "low",
+      "tier": 1
+    }
+  },
+  "by_drug": {
+    "Metformin IR": {
+      "cost": "low",
+      "tier": 1,
+      "price_per_month": 10
+    },
+    "Metformin SA": {
+      "cost": "low",
+      "tier": 1,
+      "price_per_month": 12
+    },
+    "Tirzepatide": {
+      "cost": "very_high",
+      "tier": 4,
+      "price_per_month": 350
+    },
+    "Semaglutide": {
+      "cost": "high",
+      "tier": 3,
+      "price_per_month": 220
+    },
+    "Dulaglutide": {
+      "cost": "high",
+      "tier": 3,
+      "price_per_month": 180
+    },
+    "Semaglutide Oral": {
+      "cost": "high",
+      "tier": 3,
+      "price_per_month": 250
+    }
+  }
+}
