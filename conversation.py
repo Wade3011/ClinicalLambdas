@@ -10,8 +10,7 @@ Conversation Lambda: follow-up Q&A about a stored recommendation.
 Event body: { "question": "...", "recommendationTimestamp": "..." }.
 userID from JWT (requestContext.authorizer.claims.sub or authorizer.sub).
 Env: TABLE_NAME (default T2D), BEDROCK_MODEL_ID (required), BEDROCK_REGION (optional),
-     BEDROCK_KNOWLEDGE_BASE_ID (optional; when set, retrieves from KB and adds to prompt),
-     BEDROCK_PROMPT_CACHE (optional; set to 0/false/no to disable static system-prompt caching).
+     BEDROCK_KNOWLEDGE_BASE_ID (optional; when set, retrieves from KB and adds to prompt).
 """
 
 import json
@@ -309,10 +308,8 @@ Provide a concise answer in 1–3 sentences based on the context and knowledge b
     return system, user_content
 
 
-def _call_bedrock(system_message, user_message, model_id, region=None, max_tokens=1024, temperature=0.2, use_cache=True):
-    """Call Bedrock Converse API; return (answer_text, input_tokens, output_tokens).
-    When use_cache is True, the system message (static T2D expert role) is sent with a cache checkpoint
-    so Bedrock can cache it; recommendation context and user question stay in the user message (not cached)."""
+def _call_bedrock(system_message, user_message, model_id, region=None, max_tokens=1024, temperature=0.2):
+    """Call Bedrock Converse API; return (answer_text, input_tokens, output_tokens)."""
     if not boto3:
         raise RuntimeError("boto3 not available")
     kwargs = {"service_name": "bedrock-runtime"}
@@ -329,14 +326,7 @@ def _call_bedrock(system_message, user_message, model_id, region=None, max_token
         "inferenceConfig": {"maxTokens": max_tokens, "temperature": temperature},
     }
     if system_message:
-        if use_cache:
-            # Cache checkpoint after static system prompt (1h TTL on supported models; 5m default otherwise)
-            request_kw["system"] = [
-                {"text": system_message},
-                {"cachePoint": {"type": "default", "ttl": "1h"}},
-            ]
-        else:
-            request_kw["system"] = [{"text": system_message}]
+        request_kw["system"] = [{"text": system_message}]
     response = client.converse(**request_kw)
     usage = response.get("usage") or {}
     input_tokens = int(usage.get("inputTokens", 0))
@@ -453,10 +443,8 @@ def handler(event, context):
             _log("BEDROCK_MODEL_ID not set")
             return _response(503, {"error": "BEDROCK_MODEL_ID is not configured. Set it to the same value as your ClinicalCalcs Lambda."})
 
-        _cache_val = (os.environ.get("BEDROCK_PROMPT_CACHE", "") or "").strip().lower()
-        use_cache = _cache_val not in ("0", "false", "no")
         answer, input_tokens, output_tokens = _call_bedrock(
-            system_msg, user_msg, model_id, region=bedrock_region, use_cache=use_cache
+            system_msg, user_msg, model_id, region=bedrock_region
         )
         _log(
             f"tokens: input={input_tokens} output={output_tokens} total={input_tokens + output_tokens}"
