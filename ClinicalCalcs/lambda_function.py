@@ -6,6 +6,7 @@ All logic lives in config_loader, transform, dosing, glucose, scoring, response,
 import json
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -245,6 +246,45 @@ def _build_retrieval_query(request_data, top_results, is_deescalation=False):
         query_parts.append("Additional context: {}".format(additional_context))
 
     return ". ".join(p for p in query_parts if p)
+
+
+def _build_targeted_retrieval_query(top_results):
+    """Build a short query for the targeted KB (drug/class-specific PDFs). Uses top 2-3 drug and class names."""
+    recommended = []
+    for option in (top_results or [])[:3]:
+        if not isinstance(option, dict):
+            continue
+        drug = (option.get("drug") or "").strip()
+        drug_class = (option.get("class") or "").strip()
+        if drug_class and drug and drug != "No Change" and drug_class != "No Change":
+            recommended.append("{} {}".format(drug_class, drug))
+        elif drug_class and drug_class != "No Change":
+            recommended.append(drug_class)
+        elif drug and drug != "No Change":
+            recommended.append(drug)
+    if not recommended:
+        return "Type 2 diabetes medication dosing and guidelines"
+    return "Dosing, safety, and guidelines for: " + ", ".join(recommended)
+
+
+def _retrieve_kb_dual_query(kb_id, generic_query, targeted_query, region=None, number_of_results=5):
+    """Run two retrievals against the same KB in parallel (generic + targeted query). Returns (merged_refs_string, total_chunk_count)."""
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        f_gen = executor.submit(
+            retrieve_from_bedrock_kb, kb_id, generic_query, region=region, number_of_results=number_of_results
+        )
+        f_tgt = executor.submit(
+            retrieve_from_bedrock_kb, kb_id, targeted_query, region=region, number_of_results=number_of_results
+        )
+        refs_gen, count_gen = f_gen.result()
+        refs_tgt, count_tgt = f_tgt.result()
+    parts = []
+    if refs_gen and refs_gen.strip():
+        parts.append(refs_gen.strip())
+    if refs_tgt and refs_tgt.strip():
+        parts.append(refs_tgt.strip())
+    merged = "\n\n".join(parts) if parts else ""
+    return merged, count_gen + count_tgt
 
 
 def _no_change_medication_label(patient, config):
@@ -531,7 +571,11 @@ def lambda_handler(event, context):
                         drug_classes = _build_drug_classes_from_config(config)
                         top_two_for_prompt = top3_deesc[:2] if len(top3_deesc) >= 2 else (top3_deesc[:1] if top3_deesc else [])
                         kb_query = _build_retrieval_query(request_data, top3_deesc, is_deescalation=True)
-                        kb_refs, kb_chunk_count = retrieve_from_bedrock_kb(bedrock_kb_id, kb_query, region=bedrock_region, number_of_results=5)
+                        targeted_query = _build_targeted_retrieval_query(top3_deesc)
+                        kb_refs, kb_chunk_count = _retrieve_kb_dual_query(
+                            bedrock_kb_id, kb_query, targeted_query,
+                            region=bedrock_region, number_of_results=5,
+                        )
                         system_message, prompt = build_claude_prompt(
                             request_data, results_deesc or [], drug_classes, patient,
                             alternative_drug_names=alternative_drug_names,
@@ -756,7 +800,11 @@ def lambda_handler(event, context):
                 drug_classes = _build_drug_classes_from_config(config)
                 top_two_for_prompt = top_two_choices_by_fit[:2] if top_two_choices_by_fit and len(top_two_choices_by_fit) >= 2 else None
                 kb_query = _build_retrieval_query(request_data, top_two_choices_by_fit or [], is_deescalation=False)
-                kb_refs, kb_chunk_count = retrieve_from_bedrock_kb(bedrock_kb_id, kb_query, region=bedrock_region, number_of_results=5)
+                targeted_query = _build_targeted_retrieval_query(top_two_choices_by_fit or [])
+                kb_refs, kb_chunk_count = _retrieve_kb_dual_query(
+                    bedrock_kb_id, kb_query, targeted_query,
+                    region=bedrock_region, number_of_results=5,
+                )
                 system_message, prompt = build_claude_prompt(
                     request_data, results, drug_classes, patient,
                     alternative_drug_names=alternative_drug_names,

@@ -3,8 +3,8 @@ Feedback Lambda: updates a recommendation history item with user feedback.
 Table: T2D (or TABLE_NAME env var).
 Partition key: userID (String), Sort key: timestamp (String, ISO 8601).
 
-Receives feedback (thumbs up/down + text). userID from Cognito JWT.
-recommendationTimestamp (required) identifies the exact recommendation to attach feedback to.
+Receives feedback: rating (1-5), feedbackText (non-empty), timestamp (ISO 8601), recommendationTimestamp (ISO 8601).
+userID from Cognito JWT. recommendationTimestamp required to identify the recommendation.
 """
 import json
 import os
@@ -62,7 +62,7 @@ def _get_user_id(event):
 def handler(event, context):
     """
     Updates the recommendation history item with feedback.
-    Expects body: { type, feedbackText, recommendationTimestamp }
+    Expects body: { rating (1-5), feedbackText (non-empty), timestamp (ISO 8601), recommendationTimestamp (ISO 8601) }
     userID from Cognito JWT. recommendationTimestamp required to identify the recommendation.
     Returns 200 { updated: true, save: "success" } or error.
     """
@@ -73,11 +73,19 @@ def handler(event, context):
         if not user_id:
             return _response(400, {"error": "Missing userID (Cognito auth required)", "save": "fail"})
 
-        feedback_type = data.get("type")
-        feedback_text = data.get("feedbackText", "")
+        rating = data.get("rating")
+        if rating is None:
+            return _response(400, {"error": "Missing rating (integer 1-5)", "save": "fail"})
+        try:
+            rating = int(rating)
+        except (TypeError, ValueError):
+            rating = None
+        if rating not in (1, 2, 3, 4, 5):
+            return _response(400, {"error": "Invalid rating (must be integer 1-5)", "save": "fail"})
 
-        if not feedback_type or feedback_type not in ("thumbs_up", "thumbs_down"):
-            return _response(400, {"error": "Missing or invalid feedback type (thumbs_up or thumbs_down)", "save": "fail"})
+        feedback_text = (data.get("feedbackText") or "").strip()
+        if not feedback_text:
+            return _response(400, {"error": "feedbackText is required and must be non-empty", "save": "fail"})
 
         rec_timestamp = data.get("recommendationTimestamp") or data.get("recommendation_timestamp")
         if not rec_timestamp:
@@ -87,11 +95,11 @@ def handler(event, context):
         if not boto3:
             return _response(500, {"error": "boto3 not available", "save": "fail"})
 
-        # Build feedback object: type, feedbackText, submittedAt (when user submitted)
+        # Build feedback object: rating, feedbackText, submittedAt (when user submitted)
         feedback_obj = {
-            "type": feedback_type,
+            "rating": rating,
             "feedbackText": feedback_text,
-            "submittedAt": data.get("timestamp") or "",
+            "submittedAt": (data.get("timestamp") or "").strip(),
         }
         feedback_dynamo = _to_dynamodb(feedback_obj)
 
