@@ -107,6 +107,20 @@ def _get_relevant_sections(question, conversation_turns, response_body):
     if assessment:
         sections["assessment"] = str(assessment).strip()
 
+    # Always include future considerations
+    future = body.get("futureConsiderations") or []
+    if isinstance(future, list):
+        future_text = "\n".join(str(x).strip() for x in future if x)
+    else:
+        future_text = str(future).strip() if future else ""
+    if future_text:
+        sections["future_considerations"] = future_text
+
+    # Include eGFR/therapy warning only if present in recommendation (not tied to user question)
+    warning = body.get("warning-eGFR") or body.get("warningEGFR")
+    if warning:
+        sections["egfr_warning"] = "eGFR/therapy warning applies; see assessment and rationale."
+
     # Intent keywords: include rationale and alternatives for "why not", cost, comparison
     if any(k in combined for k in ("why", "why not", "prefer", "instead", "alternative", "other option", "rationale", "reason")):
         rationale = body.get("rationale") or []
@@ -142,26 +156,14 @@ def _get_relevant_sections(question, conversation_turns, response_body):
             if cost_bits:
                 sections["drug_weights_cost"] = "\n".join(cost_bits)
 
-    # Kidney / renal / eGFR
+    # Kidney / renal / eGFR keywords: ensure rationale is included when user asks about kidney/renal
     if any(k in combined for k in ("kidney", "renal", "egfr", "ckd", "glomerular")):
-        sections["assessment"] = sections.get("assessment", "")  # already have
         if not sections.get("rationale"):
             rationale = body.get("rationale") or []
             if isinstance(rationale, list):
                 sections["rationale"] = "\n".join(str(x).strip() for x in rationale if x)
             else:
                 sections["rationale"] = str(rationale).strip()
-        warning = body.get("warning-eGFR") or body.get("warningEGFR")
-        if warning:
-            sections["egfr_warning"] = "eGFR/therapy warning applies; see assessment and rationale."
-
-    # Future / follow-up / monitor
-    if any(k in combined for k in ("future", "follow", "monitor", "consider", "later")):
-        future = body.get("futureConsiderations") or []
-        if isinstance(future, list):
-            sections["future_considerations"] = "\n".join(str(x).strip() for x in future if x)
-        else:
-            sections["future_considerations"] = str(future).strip()
 
     # Default: include top3 and rationale so the model has something to work with
     if "top3_and_cost" not in sections:
@@ -274,7 +276,7 @@ def _build_prompt(question, conversation_turns, relevant_sections, kb_references
     When response_mode == 'clinical_note', system omits brevity and user message omits the concise-answer line so format instructions in the question take precedence."""
     question = (question or "").strip()
     if response_mode == "clinical_note":
-        system = """You are a Type 2 Diabetes medication expert. Use only the recommendation context and KB references below. Follow the format and structure requested in the user message (e.g. ASSESSMENT, PLAN, bullet points, plain text). Do not limit length to a few sentences. Never ask for PHI/PII. If the answer is not in the context or KB, respond exactly: "Sorry, we do not have the exact answer for your question and do not want to steer you in the wrong direction. I would recommend referring to either the American Diabetes Association page, respective medical calculators or drug specific package insert material for more specifics on this inquiry." Do not invent clinical details."""
+        system = """You are a Type 2 Diabetes medication expert. Use only the recommendation context and KB references below. Write a complete clinical note: follow the format and structure requested in the user message (e.g. ASSESSMENT, PLAN, bullet points, plain text) and include all sections with full detail—do not respond with only a brief summary or one short paragraph. Never ask for PHI/PII. If the answer is not in the context or KB, respond exactly: "Sorry, we do not have the exact answer for your question and do not want to steer you in the wrong direction. I would recommend referring to either the American Diabetes Association page, respective medical calculators or drug specific package insert material for more specifics on this inquiry." Do not invent clinical details."""
     else:
         system = """You are a Type 2 Diabetes medication expert answering clinician questions (recommendations, results, other T2D questions). Use only the recommendation context and KB references below. Answer professionally and concisely (1–3 sentences). You may: answer beyond the recommendation; support communication/health literacy; add note context; counsel on new-therapy factors; give nutrition guidance; explain T2 management. Never ask for PHI/PII. If the answer is not in the context or KB, respond exactly: "Sorry, we do not have the exact answer for your question and do not want to steer you in the wrong direction. I would recommend referring to either the American Diabetes Association page, respective medical calculators or drug specific package insert material for more specifics on this inquiry." Do not invent clinical details."""
 
@@ -378,14 +380,28 @@ def handler(event, context):
             return _response(400, {"error": "Missing userID (Cognito auth required)"})
 
         response_mode = (data.get("responseMode") or data.get("response_mode") or "").strip() or None
+        raw_question = (data.get("question") or "").strip()
+        # Fallback: if frontend didn't send responseMode but question asks to draft/generate a clinical note, use note mode
+        if response_mode is None and raw_question:
+            _head = raw_question[:400].lower()
+            if "draft a clinical note" in _head or "generate a clinical note" in _head:
+                response_mode = "clinical_note"
+                _log("responseMode inferred as clinical_note from question text")
         max_chars = CLINICAL_NOTE_MAX_CHARS if response_mode == "clinical_note" else QUESTION_MAX_CHARS
-        question = (data.get("question") or "").strip()[:max_chars]
+        question = raw_question[:max_chars]
         rec_ts = data.get("recommendationTimestamp") or data.get("recommendation_timestamp") or ""
         rec_ts = rec_ts.strip() if isinstance(rec_ts, str) else ""
         if not question:
             return _response(400, {"error": "Missing question"})
         if not rec_ts:
             return _response(400, {"error": "Missing recommendationTimestamp"})
+
+        # Log request summary for debugging (visible in CloudWatch)
+        _log(f"request: responseMode={response_mode!r} question_len={len(question)} rec_ts={rec_ts[:36] + '...' if len(rec_ts) > 36 else rec_ts!r}")
+        _question_preview = question[:500].replace("\n", " ").strip()
+        if len(question) > 500:
+            _question_preview += " ..."
+        _log(f"question_preview: {_question_preview!r}")
 
         # In-code guardrails: block unsafe/off-topic/PII without calling Bedrock (0 tokens)
         allowed, canned = _input_guardrails(question, response_mode=response_mode)
@@ -437,6 +453,10 @@ def handler(event, context):
 
         # Relevant sections from intent (conversation + question)
         relevant = _get_relevant_sections(question, conversation_native, response_body)
+        # In note mode, frontend already sends medication and future considerations in the question; omit from backend context to avoid redundancy
+        if response_mode == "clinical_note":
+            _drop = ("future_considerations", "top3", "top3_and_cost", "drug_weights_cost")
+            relevant = {k: v for k, v in relevant.items() if k not in _drop}
 
         # Optional: retrieve from Bedrock Knowledge Base (files you sync to the KB)
         kb_id = (os.environ.get("BEDROCK_KNOWLEDGE_BASE_ID") or "").strip()
@@ -454,13 +474,16 @@ def handler(event, context):
             question, conversation_native, relevant, kb_references_section=kb_section or None, response_mode=response_mode
         )
 
+        # Log prompt sizes and mode (CloudWatch)
+        max_tokens = 4096 if response_mode == "clinical_note" else 1024
+        _log(f"prompt: system_len={len(system_msg)} user_len={len(user_msg)} max_tokens={max_tokens}")
+
         # Same env vars as ClinicalCalcs: no default model; require BEDROCK_MODEL_ID
         model_id = (os.environ.get("BEDROCK_MODEL_ID") or "").strip()
         if not model_id:
             _log("BEDROCK_MODEL_ID not set")
             return _response(503, {"error": "BEDROCK_MODEL_ID is not configured. Set it to the same value as your ClinicalCalcs Lambda."})
 
-        max_tokens = 4096 if response_mode == "clinical_note" else 1024
         answer, input_tokens, output_tokens = _call_bedrock(
             system_msg, user_msg, model_id, region=bedrock_region, max_tokens=max_tokens
         )
