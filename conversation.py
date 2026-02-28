@@ -8,6 +8,7 @@ Conversation Lambda: follow-up Q&A about a stored recommendation.
 - Calls Bedrock to generate an answer, then appends the turn to conversation in DB.
 
 Event body: { "question": "...", "recommendationTimestamp": "..." }.
+Optional: responseMode (e.g. "clinical_note") — when set, skips concise-answer guardrail and allows structured note format from the user message.
 userID from JWT (requestContext.authorizer.claims.sub or authorizer.sub).
 Env: TABLE_NAME (default T2D), BEDROCK_MODEL_ID (required), BEDROCK_REGION (optional),
      BEDROCK_KNOWLEDGE_BASE_ID (optional; when set, retrieves from KB and adds to prompt).
@@ -185,6 +186,7 @@ def _get_relevant_sections(question, conversation_turns, response_body):
 # ---------- Lightweight guardrails (no Bedrock product; minimal tokens) ----------
 # Max question length (chars) to avoid token blow-up
 QUESTION_MAX_CHARS = 500
+CLINICAL_NOTE_MAX_CHARS = 8000  # when responseMode is clinical_note, allow longer prompt
 
 # Off-topic: block if question has no relevance to recommendation/diabetes/medication
 _OFF_TOPIC_REJECT_PHRASES = (
@@ -199,10 +201,11 @@ _SAFETY_BLOCK_PHRASES = (
 # PII: don't invite model to store or repeat SSN, etc.
 _PII_PROBE_PHRASES = ("my ssn is", "social security", "my dob is", "remember my", "store my")
 
-def _input_guardrails(question):
+def _input_guardrails(question, response_mode=None):
     """
     Run before Bedrock. Returns (allowed: bool, canned_response: str | None).
     If not allowed, return canned_response and skip Bedrock (0 tokens).
+    When response_mode == 'clinical_note', skip off-topic check so structured note prompts pass.
     """
     if not question or not question.strip():
         return False, None
@@ -215,8 +218,8 @@ def _input_guardrails(question):
     for p in _PII_PROBE_PHRASES:
         if p in q:
             return False, "I don't collect or store personal information. Please ask about your medication recommendation."
-    # Off-topic: very loose—only block clearly unrelated
-    if len(q) > 20:
+    # Off-topic: skip when clinical_note (structured note prompt may not contain med keywords)
+    if response_mode != "clinical_note" and len(q) > 20:
         has_med = any(x in q for x in ("medication", "drug", "insulin", "metformin", "recommend", "diabetes", "blood sugar", "a1c", "dose", "why", "cost", "alternative", "option", "kidney", "renal", "weight", "glp", "sglt", "oral", "injection"))
         has_followup = any(x in q for x in ("why ", "what about", "how about", "when ", "can i", "should i", "?"))
         if not has_med and not has_followup:
@@ -265,11 +268,15 @@ def _retrieve_from_bedrock_kb(knowledge_base_id, query, region=None, number_of_r
         return "", 0
 
 
-def _build_prompt(question, conversation_turns, relevant_sections, kb_references_section=None):
+def _build_prompt(question, conversation_turns, relevant_sections, kb_references_section=None, response_mode=None):
     """Build system and user message for Bedrock.
-    kb_references_section: optional string from Knowledge Base retrieval to include in the prompt."""
+    kb_references_section: optional string from Knowledge Base retrieval to include in the prompt.
+    When response_mode == 'clinical_note', system omits brevity and user message omits the concise-answer line so format instructions in the question take precedence."""
     question = (question or "").strip()
-    system = """You are a Type 2 Diabetes medication expert answering clinician questions (recommendations, results, other T2D questions). Use only the recommendation context and KB references below. Answer professionally and concisely (1–3 sentences). You may: answer beyond the recommendation; support communication/health literacy; add note context; counsel on new-therapy factors; give nutrition guidance; explain T2 management. Never ask for PHI/PII. If the answer is not in the context or KB, respond exactly: "Sorry, we do not have the exact answer for your question and do not want to steer you in the wrong direction. I would recommend referring to either the American Diabetes Association page, respective medical calculators or drug specific package insert material for more specifics on this inquiry." Do not invent clinical details."""
+    if response_mode == "clinical_note":
+        system = """You are a Type 2 Diabetes medication expert. Use only the recommendation context and KB references below. Follow the format and structure requested in the user message (e.g. ASSESSMENT, PLAN, bullet points, plain text). Do not limit length to a few sentences. Never ask for PHI/PII. If the answer is not in the context or KB, respond exactly: "Sorry, we do not have the exact answer for your question and do not want to steer you in the wrong direction. I would recommend referring to either the American Diabetes Association page, respective medical calculators or drug specific package insert material for more specifics on this inquiry." Do not invent clinical details."""
+    else:
+        system = """You are a Type 2 Diabetes medication expert answering clinician questions (recommendations, results, other T2D questions). Use only the recommendation context and KB references below. Answer professionally and concisely (1–3 sentences). You may: answer beyond the recommendation; support communication/health literacy; add note context; counsel on new-therapy factors; give nutrition guidance; explain T2 management. Never ask for PHI/PII. If the answer is not in the context or KB, respond exactly: "Sorry, we do not have the exact answer for your question and do not want to steer you in the wrong direction. I would recommend referring to either the American Diabetes Association page, respective medical calculators or drug specific package insert material for more specifics on this inquiry." Do not invent clinical details."""
 
     context_parts = []
     for label, text in relevant_sections.items():
@@ -297,7 +304,14 @@ def _build_prompt(question, conversation_turns, relevant_sections, kb_references
         if lines:
             conv_block = "Recent conversation:\n" + "\n".join(lines) + "\n\n"
 
-    user_content = f"""{kb_block}## Recommendation context (relevant sections only)
+    if response_mode == "clinical_note":
+        user_content = f"""{kb_block}## Recommendation context (relevant sections only)
+
+{context_block}
+
+{conv_block}User request: {question}"""
+    else:
+        user_content = f"""{kb_block}## Recommendation context (relevant sections only)
 
 {context_block}
 
@@ -353,6 +367,7 @@ def _response(status_code, body):
 def handler(event, context):
     """
     Body: { question, recommendationTimestamp }.
+    Optional: responseMode (e.g. "clinical_note") for structured note generation (no concise-answer guardrail).
     Returns 200 { answer, inputTokens, outputTokens, totalTokens } or error. Persists conversation turn to DynamoDB.
     """
     try:
@@ -362,7 +377,9 @@ def handler(event, context):
             _log("Missing userID (auth required)")
             return _response(400, {"error": "Missing userID (Cognito auth required)"})
 
-        question = (data.get("question") or "").strip()[:QUESTION_MAX_CHARS]
+        response_mode = (data.get("responseMode") or data.get("response_mode") or "").strip() or None
+        max_chars = CLINICAL_NOTE_MAX_CHARS if response_mode == "clinical_note" else QUESTION_MAX_CHARS
+        question = (data.get("question") or "").strip()[:max_chars]
         rec_ts = data.get("recommendationTimestamp") or data.get("recommendation_timestamp") or ""
         rec_ts = rec_ts.strip() if isinstance(rec_ts, str) else ""
         if not question:
@@ -371,7 +388,7 @@ def handler(event, context):
             return _response(400, {"error": "Missing recommendationTimestamp"})
 
         # In-code guardrails: block unsafe/off-topic/PII without calling Bedrock (0 tokens)
-        allowed, canned = _input_guardrails(question)
+        allowed, canned = _input_guardrails(question, response_mode=response_mode)
         if not allowed and canned:
             return _response(200, {
                 "answer": canned,
@@ -434,7 +451,7 @@ def handler(event, context):
                 _log(f"Knowledge base: retrieved {kb_chunk_count} chunks")
 
         system_msg, user_msg = _build_prompt(
-            question, conversation_native, relevant, kb_references_section=kb_section or None
+            question, conversation_native, relevant, kb_references_section=kb_section or None, response_mode=response_mode
         )
 
         # Same env vars as ClinicalCalcs: no default model; require BEDROCK_MODEL_ID
@@ -443,8 +460,9 @@ def handler(event, context):
             _log("BEDROCK_MODEL_ID not set")
             return _response(503, {"error": "BEDROCK_MODEL_ID is not configured. Set it to the same value as your ClinicalCalcs Lambda."})
 
+        max_tokens = 4096 if response_mode == "clinical_note" else 1024
         answer, input_tokens, output_tokens = _call_bedrock(
-            system_msg, user_msg, model_id, region=bedrock_region
+            system_msg, user_msg, model_id, region=bedrock_region, max_tokens=max_tokens
         )
         _log(
             f"tokens: input={input_tokens} output={output_tokens} total={input_tokens + output_tokens}"
