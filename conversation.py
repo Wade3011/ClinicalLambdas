@@ -276,7 +276,13 @@ def _build_prompt(question, conversation_turns, relevant_sections, kb_references
     When response_mode == 'clinical_note', system omits brevity and user message omits the concise-answer line so format instructions in the question take precedence."""
     question = (question or "").strip()
     if response_mode == "clinical_note":
-        system = """You are a Type 2 Diabetes medication expert. Use only the recommendation context and KB references below. Write a complete clinical note: follow the format and structure requested in the user message (e.g. ASSESSMENT, PLAN, bullet points, plain text) and include all sections with full detail—do not respond with only a brief summary or one short paragraph. Never ask for PHI/PII. If the answer is not in the context or KB, respond exactly: "Sorry, we do not have the exact answer for your question and do not want to steer you in the wrong direction. I would recommend referring to either the American Diabetes Association page, respective medical calculators or drug specific package insert material for more specifics on this inquiry." Do not invent clinical details."""
+        system = """You are a Type 2 Diabetes medication expert. Use only the recommendation context and KB references below. Write a clinical note with exactly two sections:
+
+ASSESSMENT: Lead with one or two data-rich paragraphs that set the clinical picture: include specific labs (A1C, fasting glucose, eGFR if relevant), glycemic targets, and weave in any additional context from the user request (preferences, allergies, recent surgery, other reasoning). Do not repeat those same numbers in bullets. Then add at most one or two bullet sections—e.g. "Rationale and cautions:" only, or "Rationale:" and "Cautions:" if you need both. Use bullets for rationale for therapy choice and any cautions (eGFR/therapy warning, monitoring); do not add a separate "Key labs" list that duplicates the paragraph.
+
+PLAN: Do not write narrative or expand. Output only a simple bulleted list, in this order, using only what the user request provides: (1) New medication starts (drug and dose as stated), (2) Continue/adjust/discontinue any current medications, (3) Monitoring metrics selected, (4) Future considerations. One line per bullet; no explanations, no patient education section, no extra content.
+
+Never ask for PHI/PII. If the answer is not in the context or KB, respond exactly: "Sorry, we do not have the exact answer for your question and do not want to steer you in the wrong direction. I would recommend referring to either the American Diabetes Association page, respective medical calculators or drug specific package insert material for more specifics on this inquiry." Do not invent clinical details."""
     else:
         system = """You are a Type 2 Diabetes medication expert answering clinician questions (recommendations, results, other T2D questions). Use only the recommendation context and KB references below. Answer professionally and concisely (1–3 sentences). You may: answer beyond the recommendation; support communication/health literacy; add note context; counsel on new-therapy factors; give nutrition guidance; explain T2 management. Never ask for PHI/PII. If the answer is not in the context or KB, respond exactly: "Sorry, we do not have the exact answer for your question and do not want to steer you in the wrong direction. I would recommend referring to either the American Diabetes Association page, respective medical calculators or drug specific package insert material for more specifics on this inquiry." Do not invent clinical details."""
 
@@ -453,10 +459,16 @@ def handler(event, context):
 
         # Relevant sections from intent (conversation + question)
         relevant = _get_relevant_sections(question, conversation_native, response_body)
-        # In note mode, frontend already sends medication and future considerations in the question; omit from backend context to avoid redundancy
+        # Note mode: two-section format. Assessment = assessment + why this choice (rationale) + eGFR if applicable; Plan = from user request (future considerations, drug+dose, monitoring). Fold rationale and eGFR into one assessment block; drop medication/future (frontend sends those).
         if response_mode == "clinical_note":
-            _drop = ("future_considerations", "top3", "top3_and_cost", "drug_weights_cost")
-            relevant = {k: v for k, v in relevant.items() if k not in _drop}
+            _assess = (relevant.get("assessment") or "").strip()
+            _rationale = (relevant.get("rationale") or "").strip()
+            _egfr = (relevant.get("egfr_warning") or "").strip()
+            if _rationale:
+                _assess += "\n\nWhy this choice: " + _rationale
+            if _egfr:
+                _assess += "\n\n" + _egfr
+            relevant = {"assessment": _assess} if _assess else {}
 
         # Optional: retrieve from Bedrock Knowledge Base (files you sync to the KB)
         kb_id = (os.environ.get("BEDROCK_KNOWLEDGE_BASE_ID") or "").strip()
